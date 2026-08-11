@@ -121,7 +121,7 @@ def dfs_search_volume(login: str, password: str, keywords: list[str], location_c
 
 def dfs_trends_explore(login: str, password: str, keywords: list[str], location_code: int,
                         time_range: str = "past_5_years", max_retries: int = 2,
-                        tasks_per_request: int = 25) -> tuple[dict[str, pd.DataFrame], list[str]]:
+                        tasks_per_request: int = 5) -> tuple[dict[str, pd.DataFrame], list[str], dict[str, str]]:
     """Zwraca (słownik fraza -> DataFrame(date, interest), lista fraz które się nie udały).
 
     WAŻNE: każda fraza jest pytana OSOBNO (1 fraza = 1 zadanie), a nie w grupach po 5.
@@ -137,6 +137,7 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
     headers = dfs_auth_header(login, password)
     result: dict[str, pd.DataFrame] = {}
     failed: list[str] = []
+    reasons: dict[str, str] = {}  # fraza -> prawdziwy powód niepowodzenia (diagnostyka)
 
     for batch in chunked(keywords, tasks_per_request):
         payload = [
@@ -150,19 +151,26 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
         ]
 
         resp = None
+        last_exc = None
         for attempt in range(max_retries + 1):
             try:
                 resp = requests.post(f"{DFS_BASE}/keywords_data/google_trends/explore/live",
                                       headers=headers, json=payload, timeout=180)
                 resp.raise_for_status()
                 break
-            except requests.exceptions.RequestException:
+            except requests.exceptions.RequestException as e:
+                last_exc = e
                 resp = None
                 if attempt < max_retries:
                     time.sleep(2)
                 continue
 
         if resp is None:
+            detail = str(last_exc)
+            if isinstance(last_exc, requests.exceptions.HTTPError) and last_exc.response is not None:
+                detail = f"HTTP {last_exc.response.status_code}: {last_exc.response.text[:200]}"
+            for kw in batch:
+                reasons[kw] = detail
             failed.extend(batch)
             continue
 
@@ -170,6 +178,8 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
         tasks = data.get("tasks", [])
         returned_keywords = set()
         for task in tasks:
+            task_kw = (task.get("data") or {}).get("keywords", [None])[0]
+            task_status = f"{task.get('status_code')}: {task.get('status_message')}"
             for item in (task.get("result") or []):
                 if item is None:
                     continue
@@ -194,9 +204,14 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
                             tdf = tdf.dropna(subset=["data"]).sort_values("data").reset_index(drop=True)
                             result[kw] = tdf
                             returned_keywords.add(kw)
-        failed.extend(kw for kw in batch if kw not in returned_keywords)
+            if task_kw and task_kw not in returned_keywords:
+                reasons[task_kw] = task_status
+        for kw in batch:
+            if kw not in returned_keywords:
+                failed.append(kw)
+                reasons.setdefault(kw, "brak wyniku w odpowiedzi API")
         time.sleep(0.2)  # uprzejmie dla rate limitu
-    return result, failed
+    return result, failed, reasons
 
 
 # ---------------------------------------------------------------------------
@@ -607,12 +622,15 @@ if run:
 
         with st.spinner("Pobieram Google Trends (DataForSEO) — przy większej liczbie fraz może to potrwać dłużej..."):
             try:
-                trends, failed_trends = dfs_trends_explore(dfs_login, dfs_password, phrases, int(location_code),
-                                                             time_range=trends_range)
+                trends, failed_trends, trend_reasons = dfs_trends_explore(
+                    dfs_login, dfs_password, phrases, int(location_code), time_range=trends_range)
                 if failed_trends:
+                    unique_reasons = sorted(set(trend_reasons.get(kw, "nieznany powód") for kw in failed_trends))
                     st.warning(
-                        f"Nie udało się pobrać Google Trends dla {len(failed_trends)} fraz "
-                        f"(przekroczony czas oczekiwania): {', '.join(failed_trends)}. "
+                        f"Nie udało się pobrać Google Trends dla {len(failed_trends)} fraz: "
+                        f"{', '.join(failed_trends)}.\n\n"
+                        f"Powód(y) zwrócone przez API: {' | '.join(unique_reasons[:5])}"
+                        + (" (i inne)" if len(unique_reasons) > 5 else "") + ". "
                         f"Reszta danych jest kompletna — spróbuj ponownie, jeśli te frazy są kluczowe."
                     )
             except Exception as e:
