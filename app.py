@@ -161,20 +161,24 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
             for item in (task.get("result") or []):
                 if item is None:
                     continue
-                # struktura DataForSEO trends bywa zagnieżdżona: item -> data -> [{"date_from":..,"values":[..]}]
-                kws = item.get("keywords") or batch
-                series_data = item.get("data") or []
-                for idx, kw in enumerate(kws):
-                    dates, values = [], []
-                    for point in series_data:
-                        try:
-                            v = point.get("values", [None] * len(kws))[idx]
-                        except (IndexError, TypeError):
-                            v = None
-                        dates.append(point.get("date_from"))
-                        values.append(v)
-                    if dates:
-                        result[kw] = pd.DataFrame({"data": dates, "trend": values})
+                # rzeczywista struktura DataForSEO:
+                # result[] -> items[] -> {"type": "google_trends_graph", "keywords": [...], "data": [{"date_from":..,"values":[..]}]}
+                for sub in (item.get("items") or []):
+                    if sub.get("type") != "google_trends_graph":
+                        continue
+                    kws = sub.get("keywords") or batch
+                    series_data = sub.get("data") or []
+                    for idx, kw in enumerate(kws):
+                        dates, values = [], []
+                        for point in series_data:
+                            try:
+                                v = point.get("values", [None] * len(kws))[idx]
+                            except (IndexError, TypeError):
+                                v = None
+                            dates.append(point.get("date_from"))
+                            values.append(v)
+                        if dates:
+                            result[kw] = pd.DataFrame({"data": dates, "trend": values})
         time.sleep(0.3)  # uprzejmie dla rate limitu
     return result, failed
 
