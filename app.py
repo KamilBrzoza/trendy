@@ -120,12 +120,13 @@ def dfs_search_volume(login: str, password: str, keywords: list[str], location_c
 
 
 def dfs_trends_explore(login: str, password: str, keywords: list[str], location_code: int,
-                        max_retries: int = 2) -> tuple[dict[str, pd.DataFrame], list[str]]:
+                        time_range: str = "past_5_years", max_retries: int = 2) -> tuple[dict[str, pd.DataFrame], list[str]]:
     """Zwraca (słownik fraza -> DataFrame(date, interest), lista fraz które się nie udały).
 
-    Google Trends bywa wolne po stronie DataForSEO, więc: dłuższy timeout, ponowne próby
-    dla pojedynczego batcha i brak przerywania całego biegu przy jednym niepowodzeniu —
-    reszta fraz i tak zostanie policzona."""
+    Domyślnie pobiera 5 lat historii (tak jak widok w trends.google.com), żeby wykres
+    faktycznie pokazywał trend, a nie kilka punktów. Google Trends bywa wolne po stronie
+    DataForSEO, więc: dłuższy timeout, ponowne próby dla pojedynczego batcha i brak
+    przerywania całego biegu przy jednym niepowodzeniu — reszta fraz i tak zostanie policzona."""
     headers = dfs_auth_header(login, password)
     result: dict[str, pd.DataFrame] = {}
     failed: list[str] = []
@@ -134,7 +135,7 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
         payload = [{
             "keywords": batch,
             "location_code": location_code,
-            "time_range": "past_12_months",
+            "time_range": time_range,
             "type": "web",
         }]
 
@@ -178,7 +179,9 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
                             dates.append(point.get("date_from"))
                             values.append(v)
                         if dates:
-                            result[kw] = pd.DataFrame({"data": dates, "trend": values})
+                            tdf = pd.DataFrame({"data": pd.to_datetime(dates, errors="coerce"), "trend": values})
+                            tdf = tdf.dropna(subset=["data"]).sort_values("data").reset_index(drop=True)
+                            result[kw] = tdf
         time.sleep(0.3)  # uprzejmie dla rate limitu
     return result, failed
 
@@ -217,6 +220,43 @@ def senuto_get_volumes(bearer_token: str, keywords: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Sygnał z Google Trends (osobno od wolumenu Google Ads)
+# ---------------------------------------------------------------------------
+
+def compute_trend_signal(trends: dict[str, pd.DataFrame], threshold_pct: float = 10.0) -> pd.DataFrame:
+    """Dla każdej frazy porównuje średnią popularność w pierwszej i drugiej połowie
+    pobranego okresu Google Trends — daje niezależne od Google Ads potwierdzenie,
+    czy zainteresowanie frazą rośnie czy spada."""
+    rows = []
+    for phrase, tdf in trends.items():
+        if tdf is None or tdf.empty or len(tdf) < 4:
+            continue
+        d = tdf.dropna(subset=["trend"])
+        if len(d) < 4:
+            continue
+        mid = len(d) // 2
+        early = d["trend"].iloc[:mid].mean()
+        late = d["trend"].iloc[mid:].mean()
+        change = round((late - early) / early * 100, 1) if early else None
+        if change is None:
+            kierunek = "brak danych"
+        elif change > threshold_pct:
+            kierunek = "rosnący"
+        elif change < -threshold_pct:
+            kierunek = "malejący"
+        else:
+            kierunek = "stabilny"
+        rows.append({
+            "fraza": phrase,
+            "trend_google_wczesniej": round(early, 1),
+            "trend_google_ostatnio": round(late, 1),
+            "trend_google_zmiana_%": change,
+            "trend_google_kierunek": kierunek,
+        })
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------------------
 # Podsumowanie dla klienta
 # ---------------------------------------------------------------------------
 
@@ -244,7 +284,7 @@ def generate_summary(df: pd.DataFrame, threshold_pct: float = 5.0) -> dict | Non
     else:
         kierunek = "na podobnym poziomie"
 
-    return {
+    out = {
         "liczba_fraz": len(d),
         "total_now": int(total_now),
         "total_before": int(total_before),
@@ -257,6 +297,16 @@ def generate_summary(df: pd.DataFrame, threshold_pct: float = 5.0) -> dict | Non
         "top_spadajace": d.sort_values("zmiana_%", ascending=True).head(5)[["fraza", "zmiana_%"]],
     }
 
+    # niezależne potwierdzenie z Google Trends (jeśli dane są dostępne w df)
+    if "trend_google_kierunek" in df.columns:
+        tg = df.dropna(subset=["trend_google_kierunek"])
+        if not tg.empty:
+            out["trend_google_rosnacych"] = int((tg["trend_google_kierunek"] == "rosnący").sum())
+            out["trend_google_malejacych"] = int((tg["trend_google_kierunek"] == "malejący").sum())
+            out["trend_google_stabilnych"] = int((tg["trend_google_kierunek"] == "stabilny").sum())
+
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Eksport: Excel (podsumowanie + tabela + wykres) i PDF (raport dla klienta)
@@ -266,7 +316,7 @@ def _total_volume_chart_png(summary: dict) -> io.BytesIO:
     fig, ax = plt.subplots(figsize=(5, 3))
     labels = ["Rok temu", "Teraz"]
     values = [summary["total_before"], summary["total_now"]]
-    colors_ = ["#94a3b8", "#16a34a" if summary["overall_change"] and summary["overall_change"] >= 0 else "#dc2626"]
+    colors_ = ["#0B1F3A", "#D4A537"]
     ax.bar(labels, values, color=colors_)
     ax.set_ylabel("Łączny wolumen wyszukiwań / mies.")
     ax.set_title("Łączny wolumen — porównanie rok do roku")
@@ -304,11 +354,11 @@ def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame) -> io.BytesIO | None:
         return None
     d = tdf.copy()
     d["data"] = pd.to_datetime(d["data"], errors="coerce")
-    d = d.dropna(subset=["data"])
+    d = d.dropna(subset=["data"]).sort_values("data")
     if d.empty:
         return None
     fig, ax = plt.subplots(figsize=(6, 2.5))
-    ax.plot(d["data"], d["trend"], color="#2563eb", linewidth=1.5)
+    ax.plot(d["data"], d["trend"], color="#D4A537", linewidth=1.5)
     ax.set_title(f"Google Trends: {phrase}", fontsize=10)
     ax.set_ylabel("Popularność (0–100)")
     fig.autofmt_xdate()
@@ -327,8 +377,8 @@ def generate_excel_report(df: pd.DataFrame, summary: dict | None) -> bytes:
 
         if summary is not None:
             ws = writer.book.create_sheet("Podsumowanie", 0)
-            bold = Font(bold=True)
-            title = Font(bold=True, size=14)
+            bold = Font(bold=True, color="0B1F3A")
+            title = Font(bold=True, size=14, color="0B1F3A")
 
             ws["A1"] = "Aura Herbals — podsumowanie fraz"
             ws["A1"].font = title
@@ -370,6 +420,8 @@ def generate_excel_report(df: pd.DataFrame, summary: dict | None) -> bytes:
             cats_ref = Reference(ws, min_col=4, min_row=5, max_row=6)
             chart.add_data(data_ref, titles_from_data=False)
             chart.set_categories(cats_ref)
+            if chart.series:
+                chart.series[0].graphicalProperties.solidFill = "D4A537"
             chart.width = 12
             chart.height = 7
             ws.add_chart(chart, "D9")
@@ -383,9 +435,11 @@ def generate_excel_report(df: pd.DataFrame, summary: dict | None) -> bytes:
 def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm)
+    NAVY = colors.HexColor("#0B1F3A")
+    GOLD = colors.HexColor("#D4A537")
     styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=18, spaceAfter=6)
-    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=13, spaceBefore=12, spaceAfter=6)
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=18, spaceAfter=6, textColor=NAVY)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=13, spaceBefore=12, spaceAfter=6, textColor=NAVY)
     body = styles["BodyText"]
 
     story = [
@@ -412,7 +466,8 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) ->
             colWidths=[5.5 * cm] * 3,
         )
         metrics_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f1f5f9")),
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
             ("ALIGN", (0, 0), (-1, -1), "CENTER"),
             ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
@@ -501,6 +556,14 @@ with st.sidebar:
     st.subheader("Ustawienia")
     location_code = st.number_input("Kod lokalizacji DataForSEO (Polska = 2616)", value=2616, step=1)
     language_code = st.text_input("Kod języka DataForSEO", value="pl")
+    trends_range = st.selectbox(
+        "Okres Google Trends",
+        options=["past_5_years", "past_12_months", "past_90_days"],
+        format_func=lambda v: {"past_5_years": "5 lat (jak w trends.google.com)",
+                                "past_12_months": "12 miesięcy",
+                                "past_90_days": "90 dni"}[v],
+        index=0,
+    )
 
 st.subheader("1. Wklej listę fraz (jedna fraza w linii, max 50)")
 raw_phrases = st.text_area("Frazy", height=220, placeholder="krople na sen\nkrople na odporność\n...")
@@ -531,7 +594,8 @@ if run:
 
         with st.spinner("Pobieram Google Trends (DataForSEO) — przy większej liczbie fraz może to potrwać dłużej..."):
             try:
-                trends, failed_trends = dfs_trends_explore(dfs_login, dfs_password, phrases, int(location_code))
+                trends, failed_trends = dfs_trends_explore(dfs_login, dfs_password, phrases, int(location_code),
+                                                             time_range=trends_range)
                 if failed_trends:
                     st.warning(
                         f"Nie udało się pobrać Google Trends dla {len(failed_trends)} fraz "
@@ -558,6 +622,9 @@ if run:
         merged = vol_df
         if not senuto_df.empty:
             merged = merged.merge(senuto_df, on="fraza", how="left")
+        trend_signal_df = compute_trend_signal(trends)
+        if not trend_signal_df.empty:
+            merged = merged.merge(trend_signal_df, on="fraza", how="left")
 
         st.session_state.report_df = merged
         st.session_state.trends_data = trends
@@ -585,9 +652,16 @@ if st.session_state.report_df is not None and not st.session_state.report_df.emp
         box(zdanie)
 
         m1, m2, m3 = st.columns(3)
-        m1.metric("Frazy rosnące", summary["liczba_rosnacych"])
-        m2.metric("Frazy spadające", summary["liczba_spadajacych"])
-        m3.metric("Frazy stabilne", summary["liczba_stabilnych"])
+        m1.metric("Frazy rosnące (wolumen)", summary["liczba_rosnacych"])
+        m2.metric("Frazy spadające (wolumen)", summary["liczba_spadajacych"])
+        m3.metric("Frazy stabilne (wolumen)", summary["liczba_stabilnych"])
+
+        if "trend_google_rosnacych" in summary:
+            st.caption("Niezależne potwierdzenie z Google Trends (popularność wyszukiwań w czasie):")
+            g1, g2, g3 = st.columns(3)
+            g1.metric("Rosnący trend Google", summary["trend_google_rosnacych"])
+            g2.metric("Malejący trend Google", summary["trend_google_malejacych"])
+            g3.metric("Stabilny trend Google", summary["trend_google_stabilnych"])
 
         c1, c2 = st.columns(2)
         with c1:
@@ -623,7 +697,7 @@ if st.session_state.report_df is not None and not st.session_state.report_df.emp
         if tdf is not None and not tdf.empty:
             tdf_plot = tdf.copy()
             tdf_plot["data"] = pd.to_datetime(tdf_plot["data"], errors="coerce")
-            tdf_plot = tdf_plot.set_index("data")
+            tdf_plot = tdf_plot.dropna(subset=["data"]).sort_values("data").set_index("data")
             st.line_chart(tdf_plot["trend"])
         else:
             st.info("Brak danych trendu dla tej frazy.")

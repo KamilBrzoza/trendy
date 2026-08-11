@@ -16,7 +16,8 @@ w panelu bocznym — nie są zapisywane w kodzie.
 ## Wdrożenie na Streamlit Community Cloud (żeby udostępnić klientowi link)
 
 1. Załóż darmowe konto na [streamlit.io](https://streamlit.io) (logowanie przez GitHub).
-2. Wrzuć pliki `app.py`, `requirements.txt` do repozytorium na GitHubie (może być prywatne).
+2. Wrzuć pliki `app.py`, `requirements.txt` oraz folder `.streamlit/` (zawiera `config.toml`
+   z kolorystyką Odyseo) do repozytorium na GitHubie (może być prywatne).
 3. Na [share.streamlit.io](https://share.streamlit.io) kliknij **New app**, wskaż repo, branch
    i plik `app.py`.
 4. Kliknij **Deploy**. Po chwili dostaniesz publiczny link (np. `https://aura-herbals-frazy.streamlit.app`),
@@ -34,6 +35,10 @@ w panelu bocznym — nie są zapisywane w kodzie.
   tablicę `monthly_searches` (ostatnie 12 miesięcy) — z niej wyciągana jest wartość sprzed roku.
 - **Google Trends**: endpoint DataForSEO `keywords_data/google_trends/explore/live`
   (maks. 5 fraz na zapytanie, więc 50 fraz = 10 zapytań). Zwraca szereg czasowy popularności 0–100.
+  Domyślnie pobierane jest 5 lat historii (jak w trends.google.com) — można zmienić w panelu
+  bocznym na 12 miesięcy lub 90 dni. Dla każdej frazy liczony jest też niezależny sygnał
+  „rosnący / malejący / stabilny" (porównanie średniej z pierwszej i drugiej połowy okresu),
+  widoczny w podsumowaniu i w tabeli szczegółowej jako potwierdzenie danych z Google Ads.
 - **Senuto**: integracja jest szkieletowa (funkcja `senuto_get_volumes` w `app.py`).
   Publiczna dokumentacja Senuto (docs-api.senuto.com) wymaga konta z dostępem do API, żeby
   potwierdzić dokładną nazwę endpointu i pól w odpowiedzi dla Twojego planu — dopasuj tę funkcję
