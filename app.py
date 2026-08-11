@@ -120,24 +120,34 @@ def dfs_search_volume(login: str, password: str, keywords: list[str], location_c
 
 
 def dfs_trends_explore(login: str, password: str, keywords: list[str], location_code: int,
-                        time_range: str = "past_5_years", max_retries: int = 2) -> tuple[dict[str, pd.DataFrame], list[str]]:
+                        time_range: str = "past_5_years", max_retries: int = 2,
+                        tasks_per_request: int = 25) -> tuple[dict[str, pd.DataFrame], list[str]]:
     """Zwraca (słownik fraza -> DataFrame(date, interest), lista fraz które się nie udały).
 
-    Domyślnie pobiera 5 lat historii (tak jak widok w trends.google.com), żeby wykres
-    faktycznie pokazywał trend, a nie kilka punktów. Google Trends bywa wolne po stronie
-    DataForSEO, więc: dłuższy timeout, ponowne próby dla pojedynczego batcha i brak
-    przerywania całego biegu przy jednym niepowodzeniu — reszta fraz i tak zostanie policzona."""
+    WAŻNE: każda fraza jest pytana OSOBNO (1 fraza = 1 zadanie), a nie w grupach po 5.
+    Google Trends przy porównywaniu kilku fraz naraz normalizuje wynik względem najsilniejszej
+    frazy w grupie i potrafi zwrócić mnóstwo braków danych, jeśli w paczce trafi się fraza
+    o bardzo niskim wolumenie — psuje to wykres nawet dla dobrych fraz w tej samej paczce.
+    Osobne zapytania dają dokładnie taki wykres, jak ręczne sprawdzenie pojedynczej frazy
+    na trends.google.com. Żeby nie mnożyć zapytań HTTP, wysyłamy wiele zadań (1 fraza = 1 zadanie)
+    w jednym requeście (DataForSEO pozwala na wiele tasków w jednym POST).
+
+    Domyślnie pobiera 5 lat historii (jak w trends.google.com). Dłuższy timeout i ponowne
+    próby na wypadek wolnej odpowiedzi; jedno niepowodzenie nie przerywa całego biegu."""
     headers = dfs_auth_header(login, password)
     result: dict[str, pd.DataFrame] = {}
     failed: list[str] = []
 
-    for batch in chunked(keywords, 5):
-        payload = [{
-            "keywords": batch,
-            "location_code": location_code,
-            "time_range": time_range,
-            "type": "web",
-        }]
+    for batch in chunked(keywords, tasks_per_request):
+        payload = [
+            {
+                "keywords": [kw],
+                "location_code": location_code,
+                "time_range": time_range,
+                "type": "web",
+            }
+            for kw in batch
+        ]
 
         resp = None
         for attempt in range(max_retries + 1):
@@ -158,6 +168,7 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
 
         data = resp.json()
         tasks = data.get("tasks", [])
+        returned_keywords = set()
         for task in tasks:
             for item in (task.get("result") or []):
                 if item is None:
@@ -167,7 +178,7 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
                 for sub in (item.get("items") or []):
                     if sub.get("type") != "google_trends_graph":
                         continue
-                    kws = sub.get("keywords") or batch
+                    kws = sub.get("keywords") or []
                     series_data = sub.get("data") or []
                     for idx, kw in enumerate(kws):
                         dates, values = [], []
@@ -182,7 +193,9 @@ def dfs_trends_explore(login: str, password: str, keywords: list[str], location_
                             tdf = pd.DataFrame({"data": pd.to_datetime(dates, errors="coerce"), "trend": values})
                             tdf = tdf.dropna(subset=["data"]).sort_values("data").reset_index(drop=True)
                             result[kw] = tdf
-        time.sleep(0.3)  # uprzejmie dla rate limitu
+                            returned_keywords.add(kw)
+        failed.extend(kw for kw in batch if kw not in returned_keywords)
+        time.sleep(0.2)  # uprzejmie dla rate limitu
     return result, failed
 
 
