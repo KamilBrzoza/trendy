@@ -415,9 +415,10 @@ def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame, figsize=(5.5, 2.3)) ->
     d = tdf.copy()
     d["data"] = pd.to_datetime(d["data"], errors="coerce")
     d = d.dropna(subset=["data"]).sort_values("data")
-    if d.empty or d["trend"].notna().sum() == 0:
-        # Google Trends nie ma żadnych realnych danych dla tej frazy (same braki/missing_data)
-        # — nie rysujemy pustego, mylącego wykresu.
+    if d.empty or d["trend"].notna().sum() < 4:
+        # Google Trends ma za mało realnych punktów dla tej frazy (prawie same braki/missing_data,
+        # zostaje 0-3 punkty) — linii i tak nie da się sensownie narysować, więc pomijamy wykres
+        # zamiast rysować mylącą, pustą ramkę z przypadkowo dobraną skalą osi.
         return None
     fig, ax = _dark_fig(figsize)
     ax.plot(d["data"], d["trend"], color=ODYSEO_PURPLE_LIGHT, linewidth=1.5)
@@ -555,6 +556,37 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) ->
         Paragraph(f"Wygenerowano: {dt.date.today().strftime('%d.%m.%Y')}", footer_style),
         Spacer(1, 0.5 * cm),
     ]
+
+    # ------------------------------------------------------------------
+    # METODOLOGIA — skąd pochodzą dane i jak działają narzędzia
+    # ------------------------------------------------------------------
+    story.append(Paragraph("Skąd pochodzą dane w tym raporcie", h2))
+    story.append(Paragraph(
+        "Dane pobierane są automatycznie z API <b>DataForSEO</b> — zewnętrznego dostawcy danych "
+        "wyszukiwania, który agreguje i udostępnia w formie API te same źródła, z których korzystają "
+        "narzędzia takie jak Google Keyword Planner czy Google Trends.", body))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph(
+        "<b>Wolumen wyszukiwań</b> (kolumny „Wolumen teraz” i „Wolumen rok temu”) pochodzi z bazy "
+        "<b>Google Ads</b> (ten sam system danych co Google Keyword Planner) — to średnia miesięczna "
+        "liczba wyszukiwań danej frazy w Google, szacowana przez samego Google na podstawie "
+        "rzeczywistego ruchu w wyszukiwarce. „Wolumen rok temu” wyliczany jest z 12-miesięcznej "
+        "historii wyszukiwań, jaką Google Ads udostępnia dla każdej frazy.", body))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph(
+        "<b>Kolumna „Trend Google”</b> oraz wykresy w rozdziale 1 pochodzą z <b>Google Trends</b> — "
+        "to nie jest liczba wyszukiwań, tylko względna popularność frazy w czasie w skali 0–100 "
+        "(100 = szczyt popularności tej frazy w badanym okresie). Każda fraza jest sprawdzana "
+        "osobno, dokładnie tak jak przy ręcznym wyszukaniu pojedynczej frazy na trends.google.com. "
+        "Dla części rzadko wyszukiwanych fraz Google Trends nie ma wystarczających danych, żeby "
+        "wyznaczyć wiarygodny trend — takie przypadki są w raporcie oznaczone jako „-” lub pomijane "
+        "na wykresach (zamiast pokazywać mylące, puste wykresy).", body))
+    story.append(Spacer(1, 0.15 * cm))
+    story.append(Paragraph(
+        "Kierunek trendu („rosnący”/„malejący”/„stabilny”) liczony jest przez porównanie średniej "
+        "popularności z pierwszej i drugiej połowy badanego okresu (domyślnie 5 lat wstecz, tak jak "
+        "w standardowym widoku trends.google.com).", body))
+    story.append(Spacer(1, 0.4 * cm))
 
     # ------------------------------------------------------------------
     # ROZDZIAŁ 1: zebrane dane — pełna tabela + wszystkie wykresy Trends
