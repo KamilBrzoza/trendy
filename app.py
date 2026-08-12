@@ -415,7 +415,9 @@ def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame, figsize=(5.5, 2.3)) ->
     d = tdf.copy()
     d["data"] = pd.to_datetime(d["data"], errors="coerce")
     d = d.dropna(subset=["data"]).sort_values("data")
-    if d.empty:
+    if d.empty or d["trend"].notna().sum() == 0:
+        # Google Trends nie ma żadnych realnych danych dla tej frazy (same braki/missing_data)
+        # — nie rysujemy pustego, mylącego wykresu.
         return None
     fig, ax = _dark_fig(figsize)
     ax.plot(d["data"], d["trend"], color=ODYSEO_PURPLE_LIGHT, linewidth=1.5)
@@ -503,6 +505,12 @@ def _fmt_pct(v) -> str:
     return f"{v:+.1f}%"
 
 
+def _fmt_str(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "-"
+    return str(v)
+
+
 def _pdf_bg(canvas, doc_):
     """Czarne tło na każdej stronie PDF."""
     canvas.saveState()
@@ -513,7 +521,8 @@ def _pdf_bg(canvas, doc_):
 
 def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) -> bytes:
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm)
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
+                             leftMargin=1.3 * cm, rightMargin=1.3 * cm)
 
     styles = getSampleStyleSheet()
     h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontName="DejaVuSans-Bold",
@@ -525,6 +534,8 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) ->
     footer_style = ParagraphStyle("footer", parent=body, fontSize=8, textColor=colors.HexColor("#9CA3AF"))
     answer_style = ParagraphStyle("answer", parent=body, fontName="DejaVuSans-Bold",
                                    fontSize=16, textColor=PDF_WHITE, alignment=1, leading=22)
+    th_style = ParagraphStyle("th", parent=body, fontName="DejaVuSans-Bold", fontSize=8.5,
+                               textColor=PDF_WHITE, leading=10)
 
     def table_style(header_bg=PDF_PURPLE, header_text=PDF_WHITE):
         return TableStyle([
@@ -555,33 +566,44 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) ->
     story.append(Spacer(1, 0.3 * cm))
 
     has_trend_col = "trend_google_kierunek" in df.columns
-    header_row = ["Fraza", "Wolumen teraz", "Wolumen rok temu", "Zmiana r/r"]
+    header_labels = ["Fraza", "Wolumen teraz", "Wolumen rok temu", "Zmiana r/r"]
     if has_trend_col:
-        header_row.append("Trend Google")
+        header_labels.append("Trend Google")
+    header_row = [Paragraph(h, th_style) for h in header_labels]
     data_rows = [header_row]
     for _, r in df.iterrows():
         row = [r.get("fraza", ""), _fmt_num(r.get("wolumen_aktualny")),
                _fmt_num(r.get("wolumen_rok_temu")), _fmt_pct(r.get("zmiana_%"))]
         if has_trend_col:
-            row.append(r.get("trend_google_kierunek") or "-")
+            row.append(_fmt_str(r.get("trend_google_kierunek")))
         data_rows.append(row)
-    col_widths = [7.5 * cm, 2.7 * cm, 3 * cm, 2.5 * cm] + ([2.3 * cm] if has_trend_col else [])
+    col_widths = [7.2 * cm, 2.6 * cm, 2.9 * cm, 2.4 * cm] + ([2.2 * cm] if has_trend_col else [])
     full_table = Table(data_rows, colWidths=col_widths, repeatRows=1)
     full_table.setStyle(table_style())
     story.append(full_table)
     story.append(PageBreak())
 
-    trend_phrases = [p for p in df["fraza"] if trends.get(p) is not None]
-    if trend_phrases:
-        story.append(Paragraph("Wykresy Google Trends — wszystkie sprawdzone frazy", h2))
+    # renderujemy wykresy tylko dla fraz, dla których Google Trends faktycznie zwrócił dane
+    # (dla części długiego ogona zapytań Google zwraca same braki — pusty wykres nic by nie wnosił)
+    trend_charts = []
+    for phrase in df["fraza"]:
+        png = _trend_line_chart_png(phrase, trends.get(phrase))
+        if png is not None:
+            trend_charts.append((phrase, png))
+
+    no_data_count = len(df) - len(trend_charts)
+    if trend_charts:
+        story.append(Paragraph(
+            f"Wykresy Google Trends — frazy z dostępnymi danymi ({len(trend_charts)} z {len(df)})", h2))
+        if no_data_count:
+            story.append(Paragraph(
+                f"Dla {no_data_count} fraz Google Trends nie zwrócił żadnych danych (zbyt niski/rzadki "
+                f"wolumen wyszukiwań, żeby oszacować popularność w czasie) — pominięto puste wykresy.", body))
         story.append(Spacer(1, 0.2 * cm))
         img_w, img_h = 8.3 * cm, 3.6 * cm
-        for j in range(0, len(trend_phrases), 2):
-            pair = trend_phrases[j:j + 2]
-            imgs = []
-            for phrase in pair:
-                png = _trend_line_chart_png(phrase, trends.get(phrase))
-                imgs.append(Image(png, width=img_w, height=img_h) if png is not None else Paragraph("", body))
+        for j in range(0, len(trend_charts), 2):
+            pair = trend_charts[j:j + 2]
+            imgs = [Image(png, width=img_w, height=img_h) for _, png in pair]
             if len(imgs) == 1:
                 imgs.append(Paragraph("", body))
             row_table = Table([imgs], colWidths=[img_w + 0.3 * cm, img_w + 0.3 * cm])
