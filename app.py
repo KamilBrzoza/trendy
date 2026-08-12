@@ -27,18 +27,37 @@ import pandas as pd
 import requests
 import streamlit as st
 from openpyxl.chart import BarChart, Reference
-from openpyxl.styles import Alignment, Font
+from openpyxl.styles import Alignment, Font, PatternFill
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import cm
-from reportlab.platypus import (Image, PageBreak, Paragraph, SimpleDocTemplate,
-                                 Spacer, Table, TableStyle)
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph,
+                                 SimpleDocTemplate, Spacer, Table, TableStyle)
 
 st.set_page_config(page_title="Aura Herbals — raport fraz", layout="wide")
 
 DFS_BASE = "https://api.dataforseo.com/v3"
 SENUTO_BASE = "https://api.senuto.com/api"
+
+# Kolorystyka Odyseo: czarne tło, biel i fiolet marki jako akcent.
+ODYSEO_PURPLE = "#422AAB"
+ODYSEO_PURPLE_LIGHT = "#8B6FE8"  # jaśniejszy fiolet do linii/tekstu na czarnym tle
+PDF_BLACK = colors.HexColor("#000000")
+PDF_WHITE = colors.white
+PDF_PURPLE = colors.HexColor(ODYSEO_PURPLE)
+PDF_PURPLE_LIGHT = colors.HexColor(ODYSEO_PURPLE_LIGHT)
+PDF_GRID = colors.HexColor("#3A3A3A")
+PDF_GREEN = colors.HexColor("#22C55E")
+PDF_RED = colors.HexColor("#EF4444")
+
+# Font z polskimi znakami — DejaVu Sans jest dołączony do matplotlib, więc nie trzeba
+# dorzucać osobnego pliku .ttf do repozytorium.
+_MPL_FONT_DIR = matplotlib.get_data_path() + "/fonts/ttf"
+pdfmetrics.registerFont(TTFont("DejaVuSans", _MPL_FONT_DIR + "/DejaVuSans.ttf"))
+pdfmetrics.registerFont(TTFont("DejaVuSans-Bold", _MPL_FONT_DIR + "/DejaVuSans-Bold.ttf"))
 
 # ---------------------------------------------------------------------------
 # Pomocnicze
@@ -321,6 +340,8 @@ def generate_summary(df: pd.DataFrame, threshold_pct: float = 5.0) -> dict | Non
         "liczba_stabilnych": len(stable),
         "top_rosnace": d.sort_values("zmiana_%", ascending=False).head(5)[["fraza", "zmiana_%"]],
         "top_spadajace": d.sort_values("zmiana_%", ascending=True).head(5)[["fraza", "zmiana_%"]],
+        "all_rosnace": up.sort_values("zmiana_%", ascending=False)[["fraza", "zmiana_%"]],
+        "all_spadajace": down.sort_values("zmiana_%", ascending=True)[["fraza", "zmiana_%"]],
     }
 
     # niezależne potwierdzenie z Google Trends (jeśli dane są dostępne w df)
@@ -338,44 +359,57 @@ def generate_summary(df: pd.DataFrame, threshold_pct: float = 5.0) -> dict | Non
 # Eksport: Excel (podsumowanie + tabela + wykres) i PDF (raport dla klienta)
 # ---------------------------------------------------------------------------
 
+def _dark_fig(figsize):
+    """Figura matplotlib w kolorystyce Odyseo: czarne tło, biały tekst."""
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.patch.set_facecolor("black")
+    ax.set_facecolor("black")
+    for spine in ax.spines.values():
+        spine.set_color("#555555")
+    ax.tick_params(colors="white", labelsize=8)
+    ax.title.set_color("white")
+    ax.xaxis.label.set_color("white")
+    ax.yaxis.label.set_color("white")
+    return fig, ax
+
+
 def _total_volume_chart_png(summary: dict) -> io.BytesIO:
-    fig, ax = plt.subplots(figsize=(5, 3))
+    fig, ax = _dark_fig((5, 3))
     labels = ["Rok temu", "Teraz"]
     values = [summary["total_before"], summary["total_now"]]
-    colors_ = ["#0B1F3A", "#D4A537"]
-    ax.bar(labels, values, color=colors_)
+    ax.bar(labels, values, color=["#9CA3AF", ODYSEO_PURPLE_LIGHT])
     ax.set_ylabel("Łączny wolumen wyszukiwań / mies.")
     ax.set_title("Łączny wolumen — porównanie rok do roku")
     for i, v in enumerate(values):
-        ax.text(i, v, f"{v:,}".replace(",", " "), ha="center", va="bottom", fontsize=9)
+        ax.text(i, v, f"{v:,}".replace(",", " "), ha="center", va="bottom", fontsize=9, color="white")
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
+    fig.savefig(buf, format="png", dpi=150, facecolor="black")
     plt.close(fig)
     buf.seek(0)
     return buf
 
 
-def _movers_chart_png(summary: dict) -> io.BytesIO:
-    top_up = summary["top_rosnace"]
-    top_down = summary["top_spadajace"]
-    combo = pd.concat([top_up, top_down]).drop_duplicates(subset="fraza")
+def _movers_chart_png(up_df: pd.DataFrame, down_df: pd.DataFrame, title: str) -> io.BytesIO | None:
+    combo = pd.concat([up_df, down_df]).drop_duplicates(subset="fraza")
+    if combo.empty:
+        return None
     combo = combo.sort_values("zmiana_%")
-    fig, ax = plt.subplots(figsize=(6, max(3, 0.4 * len(combo))))
-    bar_colors = ["#dc2626" if v < 0 else "#16a34a" for v in combo["zmiana_%"]]
+    fig, ax = _dark_fig((7, max(3, 0.35 * len(combo))))
+    bar_colors = ["#EF4444" if v < 0 else "#22C55E" for v in combo["zmiana_%"]]
     ax.barh(combo["fraza"], combo["zmiana_%"], color=bar_colors)
-    ax.axvline(0, color="black", linewidth=0.8)
+    ax.axvline(0, color="white", linewidth=0.8)
     ax.set_xlabel("Zmiana r/r (%)")
-    ax.set_title("Najmocniej rosnące i spadające frazy")
+    ax.set_title(title)
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
+    fig.savefig(buf, format="png", dpi=150, facecolor="black")
     plt.close(fig)
     buf.seek(0)
     return buf
 
 
-def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame) -> io.BytesIO | None:
+def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame, figsize=(5.5, 2.3)) -> io.BytesIO | None:
     if tdf is None or tdf.empty:
         return None
     d = tdf.copy()
@@ -383,14 +417,13 @@ def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame) -> io.BytesIO | None:
     d = d.dropna(subset=["data"]).sort_values("data")
     if d.empty:
         return None
-    fig, ax = plt.subplots(figsize=(6, 2.5))
-    ax.plot(d["data"], d["trend"], color="#D4A537", linewidth=1.5)
-    ax.set_title(f"Google Trends: {phrase}", fontsize=10)
-    ax.set_ylabel("Popularność (0–100)")
+    fig, ax = _dark_fig(figsize)
+    ax.plot(d["data"], d["trend"], color=ODYSEO_PURPLE_LIGHT, linewidth=1.5)
+    ax.set_title(phrase, fontsize=9)
     fig.autofmt_xdate()
     fig.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=150)
+    fig.savefig(buf, format="png", dpi=150, facecolor="black")
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -403,8 +436,8 @@ def generate_excel_report(df: pd.DataFrame, summary: dict | None) -> bytes:
 
         if summary is not None:
             ws = writer.book.create_sheet("Podsumowanie", 0)
-            bold = Font(bold=True, color="0B1F3A")
-            title = Font(bold=True, size=14, color="0B1F3A")
+            bold = Font(bold=True, color="422AAB")
+            title = Font(bold=True, size=14, color="422AAB")
 
             ws["A1"] = "Aura Herbals — podsumowanie fraz"
             ws["A1"].font = title
@@ -447,7 +480,7 @@ def generate_excel_report(df: pd.DataFrame, summary: dict | None) -> bytes:
             chart.add_data(data_ref, titles_from_data=False)
             chart.set_categories(cats_ref)
             if chart.series:
-                chart.series[0].graphicalProperties.solidFill = "D4A537"
+                chart.series[0].graphicalProperties.solidFill = "422AAB"
             chart.width = 12
             chart.height = 7
             ws.add_chart(chart, "D9")
@@ -458,105 +491,224 @@ def generate_excel_report(df: pd.DataFrame, summary: dict | None) -> bytes:
     return buf.getvalue()
 
 
+def _fmt_num(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "-"
+    return f"{int(v):,}".replace(",", " ")
+
+
+def _fmt_pct(v) -> str:
+    if v is None or (isinstance(v, float) and pd.isna(v)):
+        return "-"
+    return f"{v:+.1f}%"
+
+
+def _pdf_bg(canvas, doc_):
+    """Czarne tło na każdej stronie PDF."""
+    canvas.saveState()
+    canvas.setFillColor(PDF_BLACK)
+    canvas.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
+    canvas.restoreState()
+
+
 def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm)
-    NAVY = colors.HexColor("#0B1F3A")
-    GOLD = colors.HexColor("#D4A537")
+
     styles = getSampleStyleSheet()
-    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontSize=18, spaceAfter=6, textColor=NAVY)
-    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontSize=13, spaceBefore=12, spaceAfter=6, textColor=NAVY)
-    body = styles["BodyText"]
+    h1 = ParagraphStyle("h1", parent=styles["Heading1"], fontName="DejaVuSans-Bold",
+                         fontSize=19, spaceAfter=6, textColor=PDF_WHITE)
+    h2 = ParagraphStyle("h2", parent=styles["Heading2"], fontName="DejaVuSans-Bold",
+                         fontSize=14, spaceBefore=14, spaceAfter=8, textColor=PDF_PURPLE_LIGHT)
+    body = ParagraphStyle("body", parent=styles["BodyText"], fontName="DejaVuSans",
+                           fontSize=10, textColor=PDF_WHITE, leading=14)
+    footer_style = ParagraphStyle("footer", parent=body, fontSize=8, textColor=colors.HexColor("#9CA3AF"))
+    answer_style = ParagraphStyle("answer", parent=body, fontName="DejaVuSans-Bold",
+                                   fontSize=16, textColor=PDF_WHITE, alignment=1, leading=22)
+
+    def table_style(header_bg=PDF_PURPLE, header_text=PDF_WHITE):
+        return TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), header_bg),
+            ("TEXTCOLOR", (0, 0), (-1, 0), header_text),
+            ("TEXTCOLOR", (0, 1), (-1, -1), PDF_WHITE),
+            ("FONTNAME", (0, 0), (-1, 0), "DejaVuSans-Bold"),
+            ("FONTNAME", (0, 1), (-1, -1), "DejaVuSans"),
+            ("ALIGN", (1, 0), (-1, -1), "CENTER"),
+            ("GRID", (0, 0), (-1, -1), 0.5, PDF_GRID),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [PDF_BLACK, colors.HexColor("#0D0D0D")]),
+        ])
 
     story = [
         Paragraph("Aura Herbals — raport trendów wyszukiwań", h1),
-        Paragraph(f"Wygenerowano: {dt.date.today().strftime('%d.%m.%Y')}", body),
-        Spacer(1, 0.4 * cm),
+        Paragraph(f"Wygenerowano: {dt.date.today().strftime('%d.%m.%Y')}", footer_style),
+        Spacer(1, 0.5 * cm),
     ]
+
+    # ------------------------------------------------------------------
+    # ROZDZIAŁ 1: zebrane dane — pełna tabela + wszystkie wykresy Trends
+    # ------------------------------------------------------------------
+    story.append(Paragraph("1. Zebrane dane", h1))
+    story.append(Paragraph(
+        f"Pełne zestawienie dla wszystkich {len(df)} sprawdzonych fraz: wolumen wyszukiwań "
+        f"aktualny i sprzed roku oraz sygnał z Google Trends.", body))
+    story.append(Spacer(1, 0.3 * cm))
+
+    has_trend_col = "trend_google_kierunek" in df.columns
+    header_row = ["Fraza", "Wolumen teraz", "Wolumen rok temu", "Zmiana r/r"]
+    if has_trend_col:
+        header_row.append("Trend Google")
+    data_rows = [header_row]
+    for _, r in df.iterrows():
+        row = [r.get("fraza", ""), _fmt_num(r.get("wolumen_aktualny")),
+               _fmt_num(r.get("wolumen_rok_temu")), _fmt_pct(r.get("zmiana_%"))]
+        if has_trend_col:
+            row.append(r.get("trend_google_kierunek") or "-")
+        data_rows.append(row)
+    col_widths = [7.5 * cm, 2.7 * cm, 3 * cm, 2.5 * cm] + ([2.3 * cm] if has_trend_col else [])
+    full_table = Table(data_rows, colWidths=col_widths, repeatRows=1)
+    full_table.setStyle(table_style())
+    story.append(full_table)
+    story.append(PageBreak())
+
+    trend_phrases = [p for p in df["fraza"] if trends.get(p) is not None]
+    if trend_phrases:
+        story.append(Paragraph("Wykresy Google Trends — wszystkie sprawdzone frazy", h2))
+        story.append(Spacer(1, 0.2 * cm))
+        img_w, img_h = 8.3 * cm, 3.6 * cm
+        for j in range(0, len(trend_phrases), 2):
+            pair = trend_phrases[j:j + 2]
+            imgs = []
+            for phrase in pair:
+                png = _trend_line_chart_png(phrase, trends.get(phrase))
+                imgs.append(Image(png, width=img_w, height=img_h) if png is not None else Paragraph("", body))
+            if len(imgs) == 1:
+                imgs.append(Paragraph("", body))
+            row_table = Table([imgs], colWidths=[img_w + 0.3 * cm, img_w + 0.3 * cm])
+            row_table.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP")]))
+            story.append(row_table)
+        story.append(PageBreak())
+    else:
+        story.append(Paragraph("Brak dostępnych wykresów Google Trends dla sprawdzonych fraz.", body))
+        story.append(PageBreak())
+
+    # ------------------------------------------------------------------
+    # ROZDZIAŁ 2: trendy — frazy rosnące i spadające
+    # ------------------------------------------------------------------
+    story.append(Paragraph("2. Trendy: frazy rosnące i spadające", h1))
+    story.append(Spacer(1, 0.2 * cm))
+
+    if summary is None:
+        story.append(Paragraph("Za mało danych, żeby wyznaczyć rosnące i spadające frazy.", body))
+    else:
+        all_up = summary["all_rosnace"]
+        all_down = summary["all_spadajace"]
+
+        movers_buf = _movers_chart_png(all_up, all_down, "Frazy rosnące i spadające — zmiana r/r")
+        if movers_buf is not None:
+            story.append(Image(movers_buf, width=15 * cm,
+                                height=15 * cm * 0.6 if len(all_up) + len(all_down) < 15 else 20 * cm))
+            story.append(Spacer(1, 0.4 * cm))
+
+        story.append(Paragraph(f"Frazy rosnące ({len(all_up)})", h2))
+        if all_up.empty:
+            story.append(Paragraph("Brak fraz rosnących powyżej progu istotności.", body))
+        else:
+            up_rows = [["Fraza", "Zmiana r/r"]] + [
+                [r["fraza"], _fmt_pct(r["zmiana_%"])] for _, r in all_up.iterrows()
+            ]
+            t_up = Table(up_rows, colWidths=[11 * cm, 4 * cm], repeatRows=1)
+            t_up.setStyle(table_style(header_bg=colors.HexColor("#14532D")))
+            story.append(t_up)
+        story.append(Spacer(1, 0.5 * cm))
+
+        story.append(Paragraph(f"Frazy spadające ({len(all_down)})", h2))
+        if all_down.empty:
+            story.append(Paragraph("Brak fraz spadających powyżej progu istotności.", body))
+        else:
+            down_rows = [["Fraza", "Zmiana r/r"]] + [
+                [r["fraza"], _fmt_pct(r["zmiana_%"])] for _, r in all_down.iterrows()
+            ]
+            t_down = Table(down_rows, colWidths=[11 * cm, 4 * cm], repeatRows=1)
+            t_down.setStyle(table_style(header_bg=colors.HexColor("#7F1D1D")))
+            story.append(t_down)
+
+    story.append(PageBreak())
+
+    # ------------------------------------------------------------------
+    # ROZDZIAŁ 3: podsumowanie — najpierw odpowiedź, potem uzasadnienie
+    # ------------------------------------------------------------------
+    story.append(Paragraph("3. Podsumowanie", h1))
+    story.append(Spacer(1, 0.3 * cm))
 
     if summary is None:
         story.append(Paragraph("Za mało danych, żeby policzyć podsumowanie.", body))
     else:
+        odpowiedz_map = {
+            "wyższy": "WYŻSZY",
+            "niższy": "NIŻSZY",
+            "na podobnym poziomie": "NA PODOBNYM POZIOMIE",
+            "brak danych": "BRAK DANYCH",
+        }
+        odpowiedz = odpowiedz_map.get(summary["kierunek"], summary["kierunek"].upper())
+
+        answer_table = Table(
+            [[Paragraph("Czy dla wybranych słów kluczowych trend wyszukiwań w tym roku "
+                        "jest mniejszy, czy większy?", ParagraphStyle(
+                            "q", parent=body, alignment=1, fontName="DejaVuSans-Bold", fontSize=11))],
+             [Paragraph(odpowiedz, answer_style)]],
+            colWidths=[16 * cm],
+        )
+        answer_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), PDF_PURPLE),
+            ("BOX", (0, 0), (-1, -1), 1, PDF_PURPLE_LIGHT),
+            ("TOPPADDING", (0, 0), (-1, -1), 10),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+        ]))
+        story.append(answer_table)
+        story.append(Spacer(1, 0.6 * cm))
+
+        story.append(Paragraph("Uzasadnienie", h2))
         zdanie = (
             f"Dla sprawdzonych {summary['liczba_fraz']} fraz łączny wolumen wyszukiwań jest "
             f"<b>{summary['kierunek']}</b> niż rok temu "
             f"({summary['overall_change']:+.1f}%, "
-            f"{summary['total_before']:,} → {summary['total_now']:,} wyszukiwań miesięcznie łącznie)."
-        ).replace(",", " ")
+            f"{_fmt_num(summary['total_before'])} → {_fmt_num(summary['total_now'])} "
+            f"wyszukiwań miesięcznie łącznie)."
+        )
         story.append(Paragraph(zdanie, body))
         story.append(Spacer(1, 0.3 * cm))
 
-        metrics_table = Table(
-            [["Frazy rosnące", "Frazy spadające", "Frazy stabilne"],
-             [str(summary["liczba_rosnacych"]), str(summary["liczba_spadajacych"]), str(summary["liczba_stabilnych"])]],
-            colWidths=[5.5 * cm] * 3,
-        )
-        metrics_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-            ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ]))
+        metrics_rows = [["Frazy rosnące", "Frazy spadające", "Frazy stabilne"],
+                         [str(summary["liczba_rosnacych"]), str(summary["liczba_spadajacych"]),
+                          str(summary["liczba_stabilnych"])]]
+        metrics_table = Table(metrics_rows, colWidths=[5.3 * cm] * 3)
+        metrics_table.setStyle(table_style())
         story.append(metrics_table)
-        story.append(Spacer(1, 0.4 * cm))
-
-        chart_buf = _total_volume_chart_png(summary)
-        story.append(Image(chart_buf, width=13 * cm, height=7.8 * cm))
         story.append(Spacer(1, 0.3 * cm))
 
-        movers_buf = _movers_chart_png(summary)
-        story.append(Image(movers_buf, width=14 * cm, height=9 * cm))
-        story.append(PageBreak())
+        if "trend_google_rosnacych" in summary:
+            story.append(Paragraph(
+                "Niezależne potwierdzenie z Google Trends (popularność wyszukiwań w czasie):", body))
+            gt_rows = [["Rosnący trend Google", "Malejący trend Google", "Stabilny trend Google"],
+                       [str(summary["trend_google_rosnacych"]), str(summary["trend_google_malejacych"]),
+                        str(summary["trend_google_stabilnych"])]]
+            gt_table = Table(gt_rows, colWidths=[5.3 * cm] * 3)
+            gt_table.setStyle(table_style())
+            story.append(gt_table)
+            story.append(Spacer(1, 0.4 * cm))
 
-        story.append(Paragraph("Najmocniej rosnące frazy", h2))
-        up_rows = [["Fraza", "Zmiana r/r"]] + [
-            [r["fraza"], f"{r['zmiana_%']:+.1f}%"] for _, r in summary["top_rosnace"].iterrows()
-        ]
-        t_up = Table(up_rows, colWidths=[11 * cm, 4 * cm])
-        t_up.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#dcfce7")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ]))
-        story.append(t_up)
-        story.append(Spacer(1, 0.4 * cm))
+        chart_buf = _total_volume_chart_png(summary)
+        story.append(Image(chart_buf, width=12 * cm, height=7.2 * cm))
 
-        story.append(Paragraph("Najmocniej spadające frazy", h2))
-        down_rows = [["Fraza", "Zmiana r/r"]] + [
-            [r["fraza"], f"{r['zmiana_%']:+.1f}%"] for _, r in summary["top_spadajace"].iterrows()
-        ]
-        t_down = Table(down_rows, colWidths=[11 * cm, 4 * cm])
-        t_down.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#fee2e2")),
-            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
-            ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ]))
-        story.append(t_down)
-
-        # wykresy Google Trends dla max 3 najmocniej rosnących fraz, jeśli dostępne
-        top_phrases_for_trend = list(summary["top_rosnace"]["fraza"].head(3))
-        trend_images = [(p, trends.get(p)) for p in top_phrases_for_trend if trends.get(p) is not None]
-        if trend_images:
-            story.append(PageBreak())
-            story.append(Paragraph("Google Trends — najmocniej rosnące frazy", h2))
-            for phrase, tdf in trend_images:
-                png = _trend_line_chart_png(phrase, tdf)
-                if png is not None:
-                    story.append(Image(png, width=14 * cm, height=5.8 * cm))
-                    story.append(Spacer(1, 0.3 * cm))
-
-    story.append(Spacer(1, 0.5 * cm))
+    story.append(Spacer(1, 0.6 * cm))
     story.append(Paragraph(
         "Źródło danych: DataForSEO (Google Ads — wolumen wyszukiwań, Google Trends — popularność 0–100). "
         "Wolumen „rok temu” pochodzi z historii miesięcznej ostatnich 12 miesięcy.",
-        ParagraphStyle("footer", parent=body, fontSize=8, textColor=colors.HexColor("#64748b")),
+        footer_style,
     ))
 
-    doc.build(story)
+    doc.build(story, onFirstPage=_pdf_bg, onLaterPages=_pdf_bg)
     return buf.getvalue()
 
 
