@@ -45,18 +45,23 @@ pojawi się w tytule wygenerowanego raportu PDF/Excel oraz w nazwie pliku.
   średniej z pierwszej i drugiej połowy okresu), widoczny w podsumowaniu i w tabeli szczegółowej
   jako potwierdzenie danych z Google Ads. Frazy z za małą liczbą realnych punktów danych (poniżej
   4) są pomijane zamiast pokazywać mylące, puste wykresy.
-- **Interfejs**: aplikacja ma dwie zakładki — „📋 Uzupełnij frazy” (główna analiza własnych fraz)
-  i „🏁 Uzupełnij konkurentów” (opcjonalna analiza konkurencji) — zamiast jednego ciągu ponumerowanych
-  kroków, żeby od razu było widać obie ścieżki, nawet zanim cokolwiek zostanie pobrane.
-- **Analiza konkurencji** (zakładka „Uzupełnij konkurentów”, opcjonalna): wpisujesz osobno listę
-  nazw konkurentów i osobno listę fraz brandowych konkurencji (bez przypisywania ich ręcznie).
-  Przycisk „Dopasuj automatycznie” dopasowuje każdą frazę do konkurenta, którego nazwa się w niej
-  pojawia (dopasowanie od najdłuższej nazwy, żeby uniknąć kolizji krótszych nazw będących
-  fragmentem dłuższych). Wynik trafia do edytowalnej tabeli, w której można poprawić błędne lub
-  brakujące dopasowania (np. gdy fraza nie zawiera dosłownej nazwy marki) przed pobraniem danych.
-  Sprawdzany jest tylko wolumen wyszukiwań z DataForSEO (bez Google Trends), pogrupowany i
-  zsumowany wg konkurenta. Wyniki trafiają jako dodatkowy rozdział 4. do PDF-a i dodatkowe
-  arkusze do Excela.
+- **Interfejs**: jedna strona, punkty 1→5 zawsze widoczne w tej samej kolejności (nic się nie
+  chowa/nie przeskakuje w numeracji): 1. Frazy, 2. Konkurenci, 3. Podsumowanie (wolumen), 4. Pobierz
+  raport, 5. Google Trends (dodatkowo).
+- **Analiza konkurencji** (punkt 2, opcjonalna): wpisujesz tylko nazwy konkurentów (jedna w linię)
+  — narzędzie samo znajduje wśród fraz z punktu 1 te, które zawierają nazwę konkurenta, i porównuje
+  je rok do roku, korzystając z danych już pobranych w punkcie 1 (bez ponownego zapytania do
+  DataForSEO). Dopasowanie działa od najdłuższej nazwy konkurenta, żeby uniknąć kolizji krótszych
+  nazw będących fragmentem dłuższych (np. „Marka X Premium” vs „Marka X”). Wynik trafia do
+  edytowalnej tabeli, w której można poprawić błędne lub brakujące dopasowania (np. gdy fraza nie
+  zawiera dosłownej nazwy marki). Sprawdzany jest tylko wolumen z DataForSEO (bez Google Trends),
+  pogrupowany i zsumowany wg konkurenta. Wyniki trafiają jako dodatkowy rozdział 5. do PDF-a i
+  dodatkowe arkusze do Excela.
+- **Google Trends celowo odłączony od tabel wolumenu**: to inna metryka (względna popularność
+  0–100, a nie liczba wyszukiwań) i bywa rozbieżna z wolumenem Google Ads. Żeby nie sugerować
+  fałszywej sprzeczności w jednej tabeli, główna odpowiedź „wyższy/niższy” (punkt 3, rozdział 4.
+  PDF-a) opiera się wyłącznie na wolumenie z Google Ads, a Google Trends pokazany jest osobno —
+  w punkcie 5 na stronie i w osobnym rozdziale 2. PDF-a oraz osobnym arkuszu w Excelu.
 - **Senuto**: integracja jest szkieletowa (funkcja `senuto_get_volumes` w `app.py`).
   Publiczna dokumentacja Senuto (docs-api.senuto.com) wymaga konta z dostępem do API, żeby
   potwierdzić dokładną nazwę endpointu i pól w odpowiedzi dla Twojego planu — dopasuj tę funkcję
