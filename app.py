@@ -391,29 +391,18 @@ def compute_competitor_summary(competitor_df: pd.DataFrame) -> pd.DataFrame:
     return grouped.sort_values("wolumen_teraz", ascending=False).reset_index(drop=True)
 
 
-def match_phrases_to_competitors(df: pd.DataFrame, competitors: list) -> pd.DataFrame:
-    """Nie pyta ponownie DataForSEO — korzysta z już pobranych danych (wolumen + zmiana r/r)
-    dla głównej listy fraz i szuka w treści każdej frazy nazwy konkurenta. Dopasowanie od
-    najdłuższej nazwy konkurenta, żeby uniknąć kolizji krótszych nazw będących fragmentem
-    dłuższych (np. „Marka X Premium” vs „Marka X”). Frazy bez dopasowania są pomijane."""
-    cols = ["konkurent", "fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]
-    comp_clean = sorted({c.strip() for c in competitors if c and c.strip()}, key=len, reverse=True)
-    if not comp_clean or df is None or df.empty:
-        return pd.DataFrame(columns=cols)
+def build_competitor_combinations(phrases: list, competitors: list) -> pd.DataFrame:
+    """Buduje iloczyn kartezjański: każda fraza z punktu 1 x każdy konkurent z punktu 2,
+    np. fraza „kolagen” + konkurent „olimp” -> nowa fraza do sprawdzenia „olimp kolagen”.
+    Te nowe, złożone frazy trzeba dopiero sprawdzić w DataForSEO — to nie są frazy już
+    pobrane w punkcie 1, tylko nowe zapytania."""
+    comp_clean = [c.strip() for c in competitors if c and c.strip()]
+    phr_clean = [p.strip() for p in phrases if p and p.strip()]
     rows = []
-    for _, r in df.iterrows():
-        fraza = str(r.get("fraza") or "")
-        fraza_lower = fraza.lower()
-        matched = next((c for c in comp_clean if c.lower() in fraza_lower), None)
-        if matched:
-            rows.append({
-                "konkurent": matched,
-                "fraza": fraza,
-                "wolumen_aktualny": r.get("wolumen_aktualny"),
-                "wolumen_rok_temu": r.get("wolumen_rok_temu"),
-                "zmiana_%": r.get("zmiana_%"),
-            })
-    return pd.DataFrame(rows, columns=cols)
+    for c in comp_clean:
+        for p in phr_clean:
+            rows.append({"konkurent": c, "fraza_bazowa": p, "fraza": f"{c} {p}".strip()})
+    return pd.DataFrame(rows, columns=["konkurent", "fraza_bazowa", "fraza"])
 
 
 # ---------------------------------------------------------------------------
@@ -476,13 +465,26 @@ def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame, figsize=(5.5, 2.3)) ->
     d = tdf.copy()
     d["data"] = pd.to_datetime(d["data"], errors="coerce")
     d = d.dropna(subset=["data"]).sort_values("data")
-    if d.empty or d["trend"].notna().sum() < 4:
+    if d.empty:
+        return None
+    valid = d.dropna(subset=["trend"])
+    if len(valid) < 4:
         # Google Trends ma za mało realnych punktów dla tej frazy (prawie same braki/missing_data,
         # zostaje 0-3 punkty) — linii i tak nie da się sensownie narysować, więc pomijamy wykres
         # zamiast rysować mylącą, pustą ramkę z przypadkowo dobraną skalą osi.
         return None
+    # Jeśli te nieliczne realne punkty są ściśnięte w bardzo krótkim okresie względem całego
+    # sprawdzanego zakresu, linia między nimi może być praktycznie niewidoczna (kilka pikseli
+    # szerokości) — wtedy wykres wygląda na pusty, mimo że technicznie dane istnieją. W takim
+    # przypadku też pomijamy wykres zamiast pokazywać mylącą, pozornie pustą ramkę.
+    total_span = (d["data"].max() - d["data"].min()).days
+    valid_span = (valid["data"].max() - valid["data"].min()).days
+    if total_span > 0 and valid_span < min(60, total_span * 0.05):
+        return None
     fig, ax = _dark_fig(figsize)
-    ax.plot(d["data"], d["trend"], color=ODYSEO_PURPLE_LIGHT, linewidth=1.5)
+    ax.plot(d["data"], d["trend"], color=ODYSEO_PURPLE_LIGHT, linewidth=1.5,
+            marker="o", markersize=3, markerfacecolor=ODYSEO_PURPLE_LIGHT, markeredgewidth=0)
+    ax.set_ylim(0, 100)
     ax.set_title(phrase, fontsize=9)
     fig.autofmt_xdate()
     fig.tight_layout()
@@ -749,8 +751,9 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict, cl
             f"Wykresy — frazy z dostępnymi danymi ({len(trend_charts)} z {len(df)})", h2))
         if no_data_count:
             story.append(Paragraph(
-                f"Dla {no_data_count} fraz Google Trends nie zwrócił żadnych danych (zbyt niski/rzadki "
-                f"wolumen wyszukiwań, żeby oszacować popularność w czasie) — pominięto puste wykresy.", body))
+                f"Dla {no_data_count} fraz Google Trends nie ma wystarczających/wiarygodnych danych "
+                f"(zbyt niski/rzadki wolumen wyszukiwań, żeby oszacować popularność w czasie) — "
+                f"pominięto puste lub mylące wykresy.", body))
         story.append(Spacer(1, 0.2 * cm))
         img_w, img_h = 8.3 * cm, 3.6 * cm
         for j in range(0, len(trend_charts), 2):
@@ -959,13 +962,10 @@ if "report_df" not in st.session_state:
     st.session_state.report_df = None
 if "trends_data" not in st.session_state:
     st.session_state.trends_data = {}
-if "competitor_base_df" not in st.session_state:
-    st.session_state.competitor_base_df = pd.DataFrame(
-        columns=["konkurent", "fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"])
-if "competitor_match_version" not in st.session_state:
-    st.session_state.competitor_match_version = 0
-if "competitor_match_signature" not in st.session_state:
-    st.session_state.competitor_match_signature = None
+if "competitor_df" not in st.session_state:
+    st.session_state.competitor_df = None
+if "competitor_summary" not in st.session_state:
+    st.session_state.competitor_summary = None
 
 # ---------------------------------------------------------------------------
 # 1. Frazy do sprawdzenia — wolumen (Google Ads) + Google Trends
@@ -1047,89 +1047,85 @@ if run:
 
         st.session_state.report_df = merged
         st.session_state.trends_data = trends
-        # nowe dane -> wymuś ponowne dopasowanie konkurentów przy następnym renderze
-        st.session_state.competitor_match_signature = None
 
 report_df = st.session_state.report_df
 has_data = report_df is not None and not report_df.empty
 
 # ---------------------------------------------------------------------------
-# 2. Konkurenci — tylko nazwy; narzędzie samo dopasowuje je do fraz z punktu 1
-# (bez ponownego pytania DataForSEO — korzysta z już pobranych danych) i
-# porównuje wolumen rok do roku dla dopasowanych fraz.
+# 2. Konkurenci — same nazwy; narzędzie samo buduje kombinacje konkurent + fraza
+# (iloczyn kartezjański fraz z punktu 1 i konkurentów), a potem sprawdza wolumen
+# dla tych nowych, złożonych fraz w DataForSEO (to nowe zapytania, bo tych fraz
+# jeszcze nie było w punkcie 1).
 # ---------------------------------------------------------------------------
 
 st.divider()
 st.subheader("2. Konkurenci (opcjonalnie)")
 st.caption(
-    "Wpisz same nazwy konkurentów (jedna w linii) — narzędzie samo znajdzie wśród fraz z punktu 1 "
-    "te, które zawierają nazwę konkurenta, i porówna je rok do roku na podstawie już pobranych danych "
-    "(tylko wolumen z DataForSEO, bez Google Trends)."
+    "Wpisz same nazwy konkurentów (jedna w linii). Narzędzie samo zbuduje kombinacje: każda fraza "
+    "z punktu 1 + każdy konkurent (np. fraza „kolagen” + konkurent „olimp” → „olimp kolagen”) i "
+    "sprawdzi wolumen wyszukiwań rok do roku dla wszystkich tych kombinacji w DataForSEO "
+    "(bez Google Trends)."
 )
-competitors_raw = st.text_area("Konkurenci", height=120, placeholder="Marka X\nMarka Y\n...",
+competitors_raw = st.text_area("Konkurenci", height=120, placeholder="olimp\nostrovit\naliness\n...",
                                 label_visibility="collapsed", key="competitors_raw")
 competitors_list = [c.strip() for c in competitors_raw.splitlines() if c.strip()]
 
-if not has_data:
+if not phrases:
     if competitors_list:
-        st.info("Najpierw pobierz dane dla fraz w punkcie 1 — wtedy dopasujemy do nich konkurentów.")
-else:
-    if competitors_list:
-        signature = (tuple(sorted(c.lower() for c in competitors_list)), tuple(report_df["fraza"]))
-        if st.session_state.competitor_match_signature != signature:
-            matched_df = match_phrases_to_competitors(report_df, competitors_list)
-            st.session_state.competitor_base_df = matched_df
-            st.session_state.competitor_match_signature = signature
-            st.session_state.competitor_match_version += 1
+        st.info("Najpierw wpisz frazy w punkcie 1 — kombinacje powstaną na ich podstawie.")
+elif competitors_list:
+    combos = build_competitor_combinations(phrases, competitors_list)
+    st.caption(
+        f"Zostanie sprawdzonych {len(combos)} kombinacji "
+        f"({len(phrases)} fraz × {len(competitors_list)} konkurentów)."
+    )
+    if len(combos) > 100:
+        st.warning("To dużo kombinacji — każde nowe zapytanie do DataForSEO jest płatne zgodnie z Twoim cennikiem.")
+    with st.expander("Podgląd kombinacji przed pobraniem"):
+        st.dataframe(combos[["konkurent", "fraza"]], hide_index=True, use_container_width=True)
 
-        if st.session_state.competitor_base_df.empty:
-            st.warning(
-                "Żadna z fraz z punktu 1 nie zawiera nazwy podanego konkurenta — sprawdź pisownię "
-                "albo dodaj brakujące frazy brandowe do listy w punkcie 1."
-            )
+    run_competitors = st.button(
+        "Pobierz dane o konkurencji (DataForSEO)", type="primary",
+        disabled=not dfs_login or not dfs_password,
+    )
+
+    if run_competitors:
+        unique_combo_phrases = combos["fraza"].drop_duplicates().tolist()
+        with st.spinner(f"Pobieram wolumen dla {len(unique_combo_phrases)} kombinacji (DataForSEO)..."):
+            try:
+                comp_vol_df = dfs_search_volume(dfs_login, dfs_password, unique_combo_phrases,
+                                                 int(location_code), language_code)
+            except Exception as e:
+                st.error(f"Błąd DataForSEO (search_volume, konkurencja): {e}")
+                comp_vol_df = pd.DataFrame()
+
+        if comp_vol_df.empty:
+            st.warning("Nie udało się pobrać danych o wolumenie dla wygenerowanych kombinacji.")
         else:
-            st.markdown("**Dopasowane frazy — sprawdź / popraw przed pobraniem raportu**")
-            competitor_editor_key = f"competitor_editor_{st.session_state.competitor_match_version}"
-            competitor_edited = st.data_editor(
-                st.session_state.competitor_base_df,
-                num_rows="dynamic",
-                use_container_width=True,
-                key=competitor_editor_key,
-                column_config={
-                    "konkurent": st.column_config.SelectboxColumn(
-                        "Konkurent", options=competitors_list + [""],
-                        help="Popraw, jeśli automatyczne dopasowanie się pomyliło.",
-                    ),
-                    "fraza": st.column_config.TextColumn("Fraza", disabled=True),
-                    "wolumen_aktualny": st.column_config.NumberColumn("Wolumen teraz", disabled=True),
-                    "wolumen_rok_temu": st.column_config.NumberColumn("Wolumen rok temu", disabled=True),
-                    "zmiana_%": st.column_config.NumberColumn("Zmiana r/r", format="%.1f%%", disabled=True),
-                },
+            competitor_df = combos.merge(
+                comp_vol_df[["fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
+                on="fraza", how="left",
             )
-            comp_df = competitor_edited.dropna(subset=["konkurent"])
-            comp_df = comp_df[comp_df["konkurent"].str.strip() != ""]
+            st.session_state.competitor_df = competitor_df
+            st.session_state.competitor_summary = compute_competitor_summary(competitor_df)
 
-            if comp_df.empty:
-                st.info("Wszystkie wiersze bez przypisanego konkurenta — nic do pokazania.")
-            else:
-                comp_summary = compute_competitor_summary(comp_df)
-                st.session_state.competitor_df = comp_df
-                st.session_state.competitor_summary = comp_summary
+    if st.session_state.competitor_df is not None and not st.session_state.competitor_df.empty:
+        comp_df = st.session_state.competitor_df
+        comp_summary = st.session_state.competitor_summary
 
-                st.markdown("**Podsumowanie wg konkurenta**")
-                st.dataframe(comp_summary, hide_index=True, use_container_width=True)
-                if comp_summary is not None and not comp_summary.empty:
-                    st.bar_chart(comp_summary.set_index("konkurent")["wolumen_teraz"])
-                st.caption("Wyniki trafiają też automatycznie jako dodatkowy rozdział do PDF-a i dodatkowe arkusze do Excela.")
-    else:
-        st.session_state.competitor_df = None
-        st.session_state.competitor_summary = None
-        st.info("Wpisz przynajmniej jedną nazwę konkurenta, żeby zobaczyć dopasowane frazy.")
+        st.markdown("**Podsumowanie wg konkurenta**")
+        st.dataframe(comp_summary, hide_index=True, use_container_width=True)
+        if comp_summary is not None and not comp_summary.empty:
+            st.bar_chart(comp_summary.set_index("konkurent")["wolumen_teraz"])
 
-if "competitor_df" not in st.session_state:
-    st.session_state.competitor_df = None
-if "competitor_summary" not in st.session_state:
-    st.session_state.competitor_summary = None
+        st.markdown("**Szczegóły — kombinacje wg konkurenta**")
+        st.dataframe(
+            comp_df[["konkurent", "fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
+            hide_index=True, use_container_width=True,
+        )
+        st.caption("Wyniki trafiają też automatycznie jako dodatkowy rozdział do PDF-a i dodatkowe arkusze do Excela.")
+else:
+    st.info("Wpisz przynajmniej jedną nazwę konkurenta, żeby zobaczyć wygenerowane kombinacje.")
 
 # ---------------------------------------------------------------------------
 # 3. Wyniki dla fraz z punktu 1 — wyłącznie wolumen (Google Ads / DataForSEO).
