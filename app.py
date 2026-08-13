@@ -391,6 +391,23 @@ def compute_competitor_summary(competitor_df: pd.DataFrame) -> pd.DataFrame:
     return grouped.sort_values("wolumen_teraz", ascending=False).reset_index(drop=True)
 
 
+def match_competitor_phrases(competitors: list, phrases: list) -> pd.DataFrame:
+    """Dla listy fraz brandowych konkurencji automatycznie dopasowuje nazwę konkurenta —
+    szuka, czy nazwa konkurenta występuje w tekście frazy (dopasowanie od najdłuższej nazwy,
+    żeby uniknąć kolizji krótszych nazw będących podciągiem dłuższych). Jeśli nic nie pasuje,
+    zostawia puste pole do ręcznego uzupełnienia."""
+    comp_clean = sorted({c.strip() for c in competitors if c and c.strip()}, key=len, reverse=True)
+    rows = []
+    for p in phrases:
+        p_clean = (p or "").strip()
+        if not p_clean:
+            continue
+        p_lower = p_clean.lower()
+        matched = next((c for c in comp_clean if c.lower() in p_lower), "")
+        rows.append({"Konkurent": matched, "Fraza": p_clean})
+    return pd.DataFrame(rows, columns=["Konkurent", "Fraza"])
+
+
 # ---------------------------------------------------------------------------
 # Eksport: Excel (podsumowanie + tabela + wykres) i PDF (raport dla klienta)
 # ---------------------------------------------------------------------------
@@ -912,251 +929,318 @@ with st.sidebar:
         index=0,
     )
 
-st.subheader("1. Wklej listę fraz (jedna fraza w linii, max 50)")
-raw_phrases = st.text_area("Frazy", height=220, placeholder="fraza kluczowa 1\nfraza kluczowa 2\n...")
-
-phrases = parse_phrases(raw_phrases)
-if phrases:
-    st.caption(f"Wykryto {len(phrases)} unikalnych fraz.")
-    if len(phrases) > 50:
-        st.warning("Wykryto więcej niż 50 fraz — zostaną przetworzone wszystkie, ale sprawdź listę.")
-
-run = st.button("2. Pobierz dane", type="primary", disabled=not phrases)
-
 if "report_df" not in st.session_state:
     st.session_state.report_df = None
 if "trends_data" not in st.session_state:
     st.session_state.trends_data = {}
-
-if run:
-    if not dfs_login or not dfs_password:
-        st.error("Podaj login i hasło do DataForSEO w panelu bocznym.")
-    else:
-        with st.spinner("Pobieram wolumen wyszukiwań (DataForSEO)..."):
-            try:
-                vol_df = dfs_search_volume(dfs_login, dfs_password, phrases, int(location_code), language_code)
-            except Exception as e:
-                st.error(f"Błąd DataForSEO (search_volume): {e}")
-                vol_df = pd.DataFrame()
-
-        st.caption("Pobieram Google Trends (DataForSEO) — każda fraza to osobne zapytanie, może to potrwać kilka minut.")
-        trends_progress = st.progress(0.0)
-        trends_status = st.empty()
-
-        def _trends_progress(i, total, kw):
-            trends_progress.progress((i + 1) / total)
-            trends_status.text(f"{i + 1}/{total}: {kw}")
-
-        try:
-            trends, failed_trends, trend_reasons = dfs_trends_explore(
-                dfs_login, dfs_password, phrases, int(location_code), time_range=trends_range,
-                progress_callback=_trends_progress)
-            trends_progress.empty()
-            trends_status.empty()
-            if failed_trends:
-                unique_reasons = sorted(set(trend_reasons.get(kw, "nieznany powód") for kw in failed_trends))
-                st.warning(
-                    f"Nie udało się pobrać Google Trends dla {len(failed_trends)} fraz: "
-                    f"{', '.join(failed_trends)}.\n\n"
-                    f"Powód(y) zwrócone przez API: {' | '.join(unique_reasons[:5])}"
-                    + (" (i inne)" if len(unique_reasons) > 5 else "") + ". "
-                    f"Reszta danych jest kompletna — spróbuj ponownie, jeśli te frazy są kluczowe."
-                )
-        except Exception as e:
-            trends_progress.empty()
-            trends_status.empty()
-            st.error(f"Błąd DataForSEO (google_trends/explore): {e}")
-            trends = {}
-
-        senuto_df = pd.DataFrame()
-        if use_senuto:
-            if not senuto_email or not senuto_password:
-                st.warning("Zaznaczono Senuto, ale brak danych logowania — pomijam ten krok.")
-            else:
-                with st.spinner("Pobieram dane z Senuto..."):
-                    try:
-                        token = senuto_get_token(senuto_email, senuto_password)
-                        senuto_df = senuto_get_volumes(token, phrases)
-                    except Exception as e:
-                        st.warning(f"Nie udało się pobrać danych z Senuto: {e}. "
-                                   f"Sprawdź endpoint w swojej dokumentacji API (docs-api.senuto.com).")
-
-        merged = vol_df
-        if not senuto_df.empty:
-            merged = merged.merge(senuto_df, on="fraza", how="left")
-        trend_signal_df = compute_trend_signal(trends)
-        if not trend_signal_df.empty:
-            merged = merged.merge(trend_signal_df, on="fraza", how="left")
-
-        st.session_state.report_df = merged
-        st.session_state.trends_data = trends
-
-# ---------------------------------------------------------------------------
-# Wyniki
-# ---------------------------------------------------------------------------
-
-if st.session_state.report_df is not None and not st.session_state.report_df.empty:
-    df = st.session_state.report_df
-
-    st.subheader("3. Podsumowanie dla klienta")
-    summary = generate_summary(df)
-    if summary is None:
-        st.info("Za mało danych (wolumen aktualny / sprzed roku), żeby policzyć podsumowanie.")
-    else:
-        box = st.success if summary["kierunek"] == "wyższy" else (
-            st.error if summary["kierunek"] == "niższy" else st.info)
-        zdanie = (
-            f"Dla sprawdzonych {summary['liczba_fraz']} fraz łączny wolumen wyszukiwań jest "
-            f"**{summary['kierunek']}** niż rok temu "
-            f"({summary['overall_change']:+.1f}%, {summary['total_before']:,} → {summary['total_now']:,} "
-            f"wyszukiwań miesięcznie łącznie)."
-        ).replace(",", " ")
-        box(zdanie)
-
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Frazy rosnące (wolumen)", summary["liczba_rosnacych"])
-        m2.metric("Frazy spadające (wolumen)", summary["liczba_spadajacych"])
-        m3.metric("Frazy stabilne (wolumen)", summary["liczba_stabilnych"])
-
-        if "trend_google_rosnacych" in summary:
-            st.caption("Niezależne potwierdzenie z Google Trends (popularność wyszukiwań w czasie):")
-            g1, g2, g3 = st.columns(3)
-            g1.metric("Rosnący trend Google", summary["trend_google_rosnacych"])
-            g2.metric("Malejący trend Google", summary["trend_google_malejacych"])
-            g3.metric("Stabilny trend Google", summary["trend_google_stabilnych"])
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.caption("Najmocniej rosnące frazy")
-            st.dataframe(summary["top_rosnace"], hide_index=True, use_container_width=True)
-        with c2:
-            st.caption("Najmocniej spadające frazy")
-            st.dataframe(summary["top_spadajace"], hide_index=True, use_container_width=True)
-
-    st.subheader("4. Szczegółowa tabela")
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
-    file_slug = slugify(client_name) if client_name else "trendomat"
-    comp_df_for_export = st.session_state.get("competitor_df")
-    comp_summary_for_export = st.session_state.get("competitor_summary")
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Pobierz CSV", data=csv_bytes, file_name=f"{file_slug}_raport_fraz.csv", mime="text/csv")
-    with col2:
-        excel_bytes = generate_excel_report(df, summary, client_name=client_name,
-                                             competitor_df=comp_df_for_export,
-                                             competitor_summary=comp_summary_for_export)
-        st.download_button("Pobierz Excel (z podsumowaniem i wykresem)", data=excel_bytes,
-                            file_name=f"{file_slug}_raport_fraz.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    with col3:
-        pdf_bytes = generate_pdf_report(df, summary, st.session_state.trends_data, client_name=client_name,
-                                         competitor_df=comp_df_for_export,
-                                         competitor_summary=comp_summary_for_export)
-        st.download_button("Pobierz PDF (raport dla klienta)", data=pdf_bytes,
-                            file_name=f"{file_slug}_raport_klienta.pdf",
-                            mime="application/pdf")
-
-    st.subheader("5. Google Trends — wykres dla wybranej frazy")
-    trends = st.session_state.trends_data
-    if trends:
-        chosen = st.selectbox("Wybierz frazę", options=sorted(trends.keys()))
-        tdf = trends.get(chosen)
-        if tdf is not None and not tdf.empty:
-            tdf_plot = tdf.copy()
-            tdf_plot["data"] = pd.to_datetime(tdf_plot["data"], errors="coerce")
-            tdf_plot = tdf_plot.dropna(subset=["data"]).sort_values("data").set_index("data")
-            st.line_chart(tdf_plot["trend"])
-        else:
-            st.info("Brak danych trendu dla tej frazy.")
-    else:
-        st.info("Brak danych Google Trends — sprawdź klucze API lub spróbuj ponownie.")
-elif st.session_state.report_df is not None:
-    st.info("Nie udało się pobrać danych. Sprawdź klucze API i spróbuj ponownie.")
-
-# ---------------------------------------------------------------------------
-# Analiza konkurencji (opcjonalna, ostatnia sekcja) — same frazy brandowe
-# konkurentów, tylko wolumen z DataForSEO (bez Google Trends)
-# ---------------------------------------------------------------------------
-
-st.divider()
-st.subheader("6. Analiza konkurencji (opcjonalnie)")
-st.caption(
-    "Wprowadź frazy brandowe konkurentów i przypisz do nich nazwę konkurenta. Sprawdzimy tylko "
-    "wolumen wyszukiwań (aktualny i sprzed roku) z DataForSEO — bez Google Trends."
-)
-
-if "competitor_input" not in st.session_state:
-    st.session_state.competitor_input = pd.DataFrame(
-        [{"Konkurent": "", "Fraza": ""} for _ in range(3)]
-    )
-
-competitor_input = st.data_editor(
-    st.session_state.competitor_input,
-    num_rows="dynamic",
-    use_container_width=True,
-    key="competitor_editor",
-    column_config={
-        "Konkurent": st.column_config.TextColumn("Konkurent", help="Nazwa marki konkurencji"),
-        "Fraza": st.column_config.TextColumn("Fraza", help="Fraza brandowa powiązana z tym konkurentem"),
-    },
-)
-
-run_competitors = st.button("Pobierz dane o konkurencji", disabled=not dfs_login or not dfs_password)
-
 if "competitor_df" not in st.session_state:
     st.session_state.competitor_df = None
 if "competitor_summary" not in st.session_state:
     st.session_state.competitor_summary = None
+if "competitor_base_df" not in st.session_state:
+    st.session_state.competitor_base_df = pd.DataFrame(columns=["Konkurent", "Fraza"])
+if "competitor_match_version" not in st.session_state:
+    st.session_state.competitor_match_version = 0
 
-if run_competitors:
-    valid_rows = competitor_input.dropna(subset=["Konkurent", "Fraza"])
-    valid_rows = valid_rows[(valid_rows["Konkurent"].str.strip() != "") & (valid_rows["Fraza"].str.strip() != "")]
-    if valid_rows.empty:
-        st.warning("Uzupełnij przynajmniej jedną parę Konkurent + Fraza.")
-    elif not dfs_login or not dfs_password:
-        st.error("Podaj login i hasło do DataForSEO w panelu bocznym.")
-    else:
-        mapping_df = valid_rows.rename(columns={"Konkurent": "konkurent", "Fraza": "fraza"}).copy()
-        mapping_df["fraza"] = mapping_df["fraza"].str.strip()
-        mapping_df["konkurent"] = mapping_df["konkurent"].str.strip()
-        unique_phrases = mapping_df["fraza"].drop_duplicates().tolist()
+tab_frazy, tab_konkurenci = st.tabs(["📋 Uzupełnij frazy", "🏁 Uzupełnij konkurentów"])
 
-        with st.spinner(f"Pobieram wolumen dla {len(unique_phrases)} fraz konkurencji (DataForSEO)..."):
-            try:
-                comp_vol_df = dfs_search_volume(dfs_login, dfs_password, unique_phrases,
-                                                 int(location_code), language_code)
-            except Exception as e:
-                st.error(f"Błąd DataForSEO (search_volume, konkurencja): {e}")
-                comp_vol_df = pd.DataFrame()
+# ---------------------------------------------------------------------------
+# Tab 1: frazy własne — wolumen + Google Trends
+# ---------------------------------------------------------------------------
 
-        if comp_vol_df.empty:
-            st.warning("Nie udało się pobrać danych o wolumenie dla podanych fraz konkurencji.")
+with tab_frazy:
+    st.subheader("Wklej listę fraz (jedna fraza w linii, max 50)")
+    raw_phrases = st.text_area("Frazy", height=220, placeholder="fraza kluczowa 1\nfraza kluczowa 2\n...",
+                                label_visibility="collapsed")
+
+    phrases = parse_phrases(raw_phrases)
+    if phrases:
+        st.caption(f"Wykryto {len(phrases)} unikalnych fraz.")
+        if len(phrases) > 50:
+            st.warning("Wykryto więcej niż 50 fraz — zostaną przetworzone wszystkie, ale sprawdź listę.")
+
+    run = st.button("Pobierz dane", type="primary", disabled=not phrases)
+
+    if run:
+        if not dfs_login or not dfs_password:
+            st.error("Podaj login i hasło do DataForSEO w panelu bocznym.")
         else:
-            competitor_df = mapping_df.merge(
-                comp_vol_df[["fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
-                on="fraza", how="left",
-            )
-            st.session_state.competitor_df = competitor_df
-            st.session_state.competitor_summary = compute_competitor_summary(competitor_df)
+            with st.spinner("Pobieram wolumen wyszukiwań (DataForSEO)..."):
+                try:
+                    vol_df = dfs_search_volume(dfs_login, dfs_password, phrases, int(location_code), language_code)
+                except Exception as e:
+                    st.error(f"Błąd DataForSEO (search_volume): {e}")
+                    vol_df = pd.DataFrame()
 
-if st.session_state.competitor_df is not None and not st.session_state.competitor_df.empty:
-    comp_df = st.session_state.competitor_df
-    comp_summary = st.session_state.competitor_summary
+            st.caption("Pobieram Google Trends (DataForSEO) — każda fraza to osobne zapytanie, może to potrwać kilka minut.")
+            trends_progress = st.progress(0.0)
+            trends_status = st.empty()
 
-    st.markdown("**Podsumowanie wg konkurenta**")
-    st.dataframe(comp_summary, hide_index=True, use_container_width=True)
+            def _trends_progress(i, total, kw):
+                trends_progress.progress((i + 1) / total)
+                trends_status.text(f"{i + 1}/{total}: {kw}")
 
-    if comp_summary is not None and not comp_summary.empty:
-        st.bar_chart(comp_summary.set_index("konkurent")["wolumen_teraz"])
+            try:
+                trends, failed_trends, trend_reasons = dfs_trends_explore(
+                    dfs_login, dfs_password, phrases, int(location_code), time_range=trends_range,
+                    progress_callback=_trends_progress)
+                trends_progress.empty()
+                trends_status.empty()
+                if failed_trends:
+                    unique_reasons = sorted(set(trend_reasons.get(kw, "nieznany powód") for kw in failed_trends))
+                    st.warning(
+                        f"Nie udało się pobrać Google Trends dla {len(failed_trends)} fraz: "
+                        f"{', '.join(failed_trends)}.\n\n"
+                        f"Powód(y) zwrócone przez API: {' | '.join(unique_reasons[:5])}"
+                        + (" (i inne)" if len(unique_reasons) > 5 else "") + ". "
+                        f"Reszta danych jest kompletna — spróbuj ponownie, jeśli te frazy są kluczowe."
+                    )
+            except Exception as e:
+                trends_progress.empty()
+                trends_status.empty()
+                st.error(f"Błąd DataForSEO (google_trends/explore): {e}")
+                trends = {}
 
-    st.markdown("**Szczegóły — frazy wg konkurenta**")
-    st.dataframe(
-        comp_df[["konkurent", "fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
-        hide_index=True, use_container_width=True,
+            senuto_df = pd.DataFrame()
+            if use_senuto:
+                if not senuto_email or not senuto_password:
+                    st.warning("Zaznaczono Senuto, ale brak danych logowania — pomijam ten krok.")
+                else:
+                    with st.spinner("Pobieram dane z Senuto..."):
+                        try:
+                            token = senuto_get_token(senuto_email, senuto_password)
+                            senuto_df = senuto_get_volumes(token, phrases)
+                        except Exception as e:
+                            st.warning(f"Nie udało się pobrać danych z Senuto: {e}. "
+                                       f"Sprawdź endpoint w swojej dokumentacji API (docs-api.senuto.com).")
+
+            merged = vol_df
+            if not senuto_df.empty:
+                merged = merged.merge(senuto_df, on="fraza", how="left")
+            trend_signal_df = compute_trend_signal(trends)
+            if not trend_signal_df.empty:
+                merged = merged.merge(trend_signal_df, on="fraza", how="left")
+
+            st.session_state.report_df = merged
+            st.session_state.trends_data = trends
+
+    if st.session_state.report_df is not None and not st.session_state.report_df.empty:
+        df = st.session_state.report_df
+
+        st.divider()
+        st.subheader("Podsumowanie dla klienta")
+        summary = generate_summary(df)
+        if summary is None:
+            st.info("Za mało danych (wolumen aktualny / sprzed roku), żeby policzyć podsumowanie.")
+        else:
+            box = st.success if summary["kierunek"] == "wyższy" else (
+                st.error if summary["kierunek"] == "niższy" else st.info)
+            zdanie = (
+                f"Dla sprawdzonych {summary['liczba_fraz']} fraz łączny wolumen wyszukiwań jest "
+                f"**{summary['kierunek']}** niż rok temu "
+                f"({summary['overall_change']:+.1f}%, {summary['total_before']:,} → {summary['total_now']:,} "
+                f"wyszukiwań miesięcznie łącznie)."
+            ).replace(",", " ")
+            box(zdanie)
+
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Frazy rosnące (wolumen)", summary["liczba_rosnacych"])
+            m2.metric("Frazy spadające (wolumen)", summary["liczba_spadajacych"])
+            m3.metric("Frazy stabilne (wolumen)", summary["liczba_stabilnych"])
+
+            if "trend_google_rosnacych" in summary:
+                st.caption("Niezależne potwierdzenie z Google Trends (popularność wyszukiwań w czasie):")
+                g1, g2, g3 = st.columns(3)
+                g1.metric("Rosnący trend Google", summary["trend_google_rosnacych"])
+                g2.metric("Malejący trend Google", summary["trend_google_malejacych"])
+                g3.metric("Stabilny trend Google", summary["trend_google_stabilnych"])
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.caption("Najmocniej rosnące frazy")
+                st.dataframe(summary["top_rosnace"], hide_index=True, use_container_width=True)
+            with c2:
+                st.caption("Najmocniej spadające frazy")
+                st.dataframe(summary["top_spadajace"], hide_index=True, use_container_width=True)
+
+        st.subheader("Szczegółowa tabela")
+        st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.subheader("Pobierz raport")
+        file_slug = slugify(client_name) if client_name else "trendomat"
+        comp_df_for_export = st.session_state.get("competitor_df")
+        comp_summary_for_export = st.session_state.get("competitor_summary")
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("Pobierz CSV", data=csv_bytes, file_name=f"{file_slug}_raport_fraz.csv", mime="text/csv")
+        with col2:
+            excel_bytes = generate_excel_report(df, summary, client_name=client_name,
+                                                 competitor_df=comp_df_for_export,
+                                                 competitor_summary=comp_summary_for_export)
+            st.download_button("Pobierz Excel (z podsumowaniem i wykresem)", data=excel_bytes,
+                                file_name=f"{file_slug}_raport_fraz.xlsx",
+                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with col3:
+            pdf_bytes = generate_pdf_report(df, summary, st.session_state.trends_data, client_name=client_name,
+                                             competitor_df=comp_df_for_export,
+                                             competitor_summary=comp_summary_for_export)
+            st.download_button("Pobierz PDF (raport dla klienta)", data=pdf_bytes,
+                                file_name=f"{file_slug}_raport_klienta.pdf",
+                                mime="application/pdf")
+
+        st.subheader("Google Trends — wykres dla wybranej frazy")
+        trends = st.session_state.trends_data
+        if trends:
+            chosen = st.selectbox("Wybierz frazę", options=sorted(trends.keys()))
+            tdf = trends.get(chosen)
+            if tdf is not None and not tdf.empty:
+                tdf_plot = tdf.copy()
+                tdf_plot["data"] = pd.to_datetime(tdf_plot["data"], errors="coerce")
+                tdf_plot = tdf_plot.dropna(subset=["data"]).sort_values("data").set_index("data")
+                st.line_chart(tdf_plot["trend"])
+            else:
+                st.info("Brak danych trendu dla tej frazy.")
+        else:
+            st.info("Brak danych Google Trends — sprawdź klucze API lub spróbuj ponownie.")
+    elif st.session_state.report_df is not None:
+        st.info("Nie udało się pobrać danych. Sprawdź klucze API i spróbuj ponownie.")
+
+# ---------------------------------------------------------------------------
+# Tab 2: analiza konkurencji — tylko wolumen z DataForSEO (bez Google Trends).
+# Wpisujesz osobno nazwy konkurentów i osobno frazy brandowe konkurencji —
+# narzędzie samo dopasowuje frazę do konkurenta (po nazwie), a wynik można
+# poprawić ręcznie przed pobraniem danych.
+# ---------------------------------------------------------------------------
+
+with tab_konkurenci:
+    st.caption(
+        "Sprawdź, jak wygląda wolumen wyszukiwań fraz brandowych konkurencji — bez Google Trends, "
+        "tylko wolumen z DataForSEO."
     )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.subheader("Konkurenci")
+        st.caption("Jedna nazwa konkurenta w linii, np. „Marka X”.")
+        competitors_raw = st.text_area("Konkurenci", height=160, placeholder="Marka X\nMarka Y\n...",
+                                        label_visibility="collapsed", key="competitors_raw")
+    with col_b:
+        st.subheader("Frazy brandowe konkurencji")
+        st.caption("Jedna fraza w linii — nie musisz podpisywać, do kogo należy.")
+        competitor_phrases_raw = st.text_area("Frazy konkurencji", height=160,
+                                               placeholder="marka x opinie\nmarka x sklep\nmarka y cena\n...",
+                                               label_visibility="collapsed", key="competitor_phrases_raw")
+
+    competitors_list = [c.strip() for c in competitors_raw.splitlines() if c.strip()]
+    competitor_phrases_list = parse_phrases(competitor_phrases_raw)
+
+    match_col, info_col = st.columns([1, 3])
+    with match_col:
+        do_match = st.button(
+            "🔄 Dopasuj automatycznie",
+            disabled=not competitors_list or not competitor_phrases_list,
+            help="Narzędzie przypisze każdą frazę do konkurenta, którego nazwa się w niej pojawia.",
+        )
+    with info_col:
+        st.caption(
+            "Dopasowywanie po nazwie konkurenta w treści frazy. Wynik możesz poprawić ręcznie "
+            "w tabeli poniżej — np. gdy fraza nie zawiera dosłownej nazwy marki."
+        )
+
+    if do_match:
+        matched_df = match_competitor_phrases(competitors_list, competitor_phrases_list)
+        st.session_state.competitor_base_df = matched_df
+        st.session_state.competitor_match_version += 1
+        unmatched = int((matched_df["Konkurent"] == "").sum()) if not matched_df.empty else 0
+        if unmatched:
+            st.warning(
+                f"{unmatched} fraz nie udało się dopasować automatycznie do żadnego konkurenta — "
+                f"uzupełnij je ręcznie w kolumnie „Konkurent” poniżej."
+            )
+        else:
+            st.success("Dopasowano wszystkie frazy. Sprawdź wynik poniżej i popraw, jeśli trzeba.")
+
+    if not st.session_state.competitor_base_df.empty:
+        st.markdown("**Sprawdź / popraw dopasowanie przed pobraniem danych**")
+        competitor_editor_key = f"competitor_editor_{st.session_state.competitor_match_version}"
+        competitor_input = st.data_editor(
+            st.session_state.competitor_base_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key=competitor_editor_key,
+            column_config={
+                "Konkurent": st.column_config.SelectboxColumn(
+                    "Konkurent", options=competitors_list + [""],
+                    help="Wybierz konkurenta, jeśli automatyczne dopasowanie się pomyliło.",
+                ),
+                "Fraza": st.column_config.TextColumn("Fraza", help="Fraza brandowa powiązana z tym konkurentem"),
+            },
+        )
+    else:
+        competitor_input = pd.DataFrame(columns=["Konkurent", "Fraza"])
+        st.info(
+            "Wpisz konkurentów i frazy powyżej, kliknij „Dopasuj automatycznie”, "
+            "a wynik pojawi się tutaj do sprawdzenia."
+        )
+
+    run_competitors = st.button(
+        "Pobierz dane o konkurencji", type="primary",
+        disabled=not dfs_login or not dfs_password or competitor_input.empty,
+    )
+
+    if run_competitors:
+        valid_rows = competitor_input.dropna(subset=["Konkurent", "Fraza"])
+        valid_rows = valid_rows[(valid_rows["Konkurent"].str.strip() != "") & (valid_rows["Fraza"].str.strip() != "")]
+        if valid_rows.empty:
+            st.warning("Uzupełnij przynajmniej jedną parę Konkurent + Fraza (dopasuj automatycznie lub ręcznie).")
+        elif not dfs_login or not dfs_password:
+            st.error("Podaj login i hasło do DataForSEO w panelu bocznym.")
+        else:
+            mapping_df = valid_rows.rename(columns={"Konkurent": "konkurent", "Fraza": "fraza"}).copy()
+            mapping_df["fraza"] = mapping_df["fraza"].str.strip()
+            mapping_df["konkurent"] = mapping_df["konkurent"].str.strip()
+            unique_phrases = mapping_df["fraza"].drop_duplicates().tolist()
+
+            with st.spinner(f"Pobieram wolumen dla {len(unique_phrases)} fraz konkurencji (DataForSEO)..."):
+                try:
+                    comp_vol_df = dfs_search_volume(dfs_login, dfs_password, unique_phrases,
+                                                     int(location_code), language_code)
+                except Exception as e:
+                    st.error(f"Błąd DataForSEO (search_volume, konkurencja): {e}")
+                    comp_vol_df = pd.DataFrame()
+
+            if comp_vol_df.empty:
+                st.warning("Nie udało się pobrać danych o wolumenie dla podanych fraz konkurencji.")
+            else:
+                competitor_df = mapping_df.merge(
+                    comp_vol_df[["fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
+                    on="fraza", how="left",
+                )
+                st.session_state.competitor_df = competitor_df
+                st.session_state.competitor_summary = compute_competitor_summary(competitor_df)
+
+    if st.session_state.competitor_df is not None and not st.session_state.competitor_df.empty:
+        comp_df = st.session_state.competitor_df
+        comp_summary = st.session_state.competitor_summary
+
+        st.divider()
+        st.markdown("**Podsumowanie wg konkurenta**")
+        st.dataframe(comp_summary, hide_index=True, use_container_width=True)
+
+        if comp_summary is not None and not comp_summary.empty:
+            st.bar_chart(comp_summary.set_index("konkurent")["wolumen_teraz"])
+
+        st.markdown("**Szczegóły — frazy wg konkurenta**")
+        st.dataframe(
+            comp_df[["konkurent", "fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(
+            "Wyniki konkurencji trafiają też automatycznie jako dodatkowy rozdział do PDF-a "
+            "i dodatkowe arkusze do Excela w zakładce „Uzupełnij frazy”."
+        )
 
 st.divider()
 st.caption(

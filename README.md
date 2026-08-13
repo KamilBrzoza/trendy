@@ -45,10 +45,18 @@ pojawi się w tytule wygenerowanego raportu PDF/Excel oraz w nazwie pliku.
   średniej z pierwszej i drugiej połowy okresu), widoczny w podsumowaniu i w tabeli szczegółowej
   jako potwierdzenie danych z Google Ads. Frazy z za małą liczbą realnych punktów danych (poniżej
   4) są pomijane zamiast pokazywać mylące, puste wykresy.
-- **Analiza konkurencji** (sekcja 6, opcjonalna): osobna tabela, w której wprowadzasz pary
-  Konkurent + Fraza (dowolna liczba wierszy). Sprawdzany jest tylko wolumen wyszukiwań z
-  DataForSEO (bez Google Trends), pogrupowany i zsumowany wg konkurenta. Wyniki trafiają jako
-  dodatkowy rozdział 4. do PDF-a i dodatkowe arkusze do Excela.
+- **Interfejs**: aplikacja ma dwie zakładki — „📋 Uzupełnij frazy” (główna analiza własnych fraz)
+  i „🏁 Uzupełnij konkurentów” (opcjonalna analiza konkurencji) — zamiast jednego ciągu ponumerowanych
+  kroków, żeby od razu było widać obie ścieżki, nawet zanim cokolwiek zostanie pobrane.
+- **Analiza konkurencji** (zakładka „Uzupełnij konkurentów”, opcjonalna): wpisujesz osobno listę
+  nazw konkurentów i osobno listę fraz brandowych konkurencji (bez przypisywania ich ręcznie).
+  Przycisk „Dopasuj automatycznie” dopasowuje każdą frazę do konkurenta, którego nazwa się w niej
+  pojawia (dopasowanie od najdłuższej nazwy, żeby uniknąć kolizji krótszych nazw będących
+  fragmentem dłuższych). Wynik trafia do edytowalnej tabeli, w której można poprawić błędne lub
+  brakujące dopasowania (np. gdy fraza nie zawiera dosłownej nazwy marki) przed pobraniem danych.
+  Sprawdzany jest tylko wolumen wyszukiwań z DataForSEO (bez Google Trends), pogrupowany i
+  zsumowany wg konkurenta. Wyniki trafiają jako dodatkowy rozdział 4. do PDF-a i dodatkowe
+  arkusze do Excela.
 - **Senuto**: integracja jest szkieletowa (funkcja `senuto_get_volumes` w `app.py`).
   Publiczna dokumentacja Senuto (docs-api.senuto.com) wymaga konta z dostępem do API, żeby
   potwierdzić dokładną nazwę endpointu i pól w odpowiedzi dla Twojego planu — dopasuj tę funkcję
