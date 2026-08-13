@@ -1,5 +1,8 @@
 """
-Aura Herbals — raport fraz: wolumen wyszukiwań (aktualny i sprzed roku) + Google Trends.
+Trendomat by Odyseo — narzędzie do analizy trendów wyszukiwań dla dowolnego klienta/marki.
+
+Sprawdza dla wklejonej listy fraz: wolumen wyszukiwań (aktualny i sprzed roku) + Google Trends,
+a opcjonalnie także wolumen wyszukiwań fraz brandowych konkurencji (bez Google Trends).
 
 Źródła danych:
 - DataForSEO: keywords_data/google_ads/search_volume/live -> wolumen aktualny + historia miesięczna
@@ -37,7 +40,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (Image, KeepTogether, PageBreak, Paragraph,
                                  SimpleDocTemplate, Spacer, Table, TableStyle)
 
-st.set_page_config(page_title="Aura Herbals — raport fraz", layout="wide")
+st.set_page_config(page_title="Trendomat by Odyseo", layout="wide")
 
 DFS_BASE = "https://api.dataforseo.com/v3"
 SENUTO_BASE = "https://api.senuto.com/api"
@@ -79,6 +82,16 @@ def parse_phrases(raw_text: str) -> list[str]:
 def chunked(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
+
+
+def slugify(text: str) -> str:
+    text = text.strip().lower()
+    text = (text.replace("ą", "a").replace("ć", "c").replace("ę", "e").replace("ł", "l")
+            .replace("ń", "n").replace("ó", "o").replace("ś", "s").replace("ź", "z").replace("ż", "z"))
+    out = "".join(c if c.isalnum() else "_" for c in text)
+    while "__" in out:
+        out = out.replace("__", "_")
+    return out.strip("_")
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +369,29 @@ def generate_summary(df: pd.DataFrame, threshold_pct: float = 5.0) -> dict | Non
 
 
 # ---------------------------------------------------------------------------
+# Analiza konkurencji (frazy brandowe przypisane do konkretnych konkurentów)
+# ---------------------------------------------------------------------------
+
+def compute_competitor_summary(competitor_df: pd.DataFrame) -> pd.DataFrame:
+    """Grupuje wolumen wyszukiwań fraz brandowych po konkurencie."""
+    if competitor_df is None or competitor_df.empty:
+        return pd.DataFrame()
+    d = competitor_df.dropna(subset=["wolumen_aktualny"]).copy()
+    if d.empty:
+        return pd.DataFrame()
+    grouped = d.groupby("konkurent", as_index=False).agg(
+        liczba_fraz=("fraza", "count"),
+        wolumen_teraz=("wolumen_aktualny", "sum"),
+        wolumen_rok_temu=("wolumen_rok_temu", "sum"),
+    )
+    grouped["zmiana_%"] = grouped.apply(
+        lambda r: round((r["wolumen_teraz"] - r["wolumen_rok_temu"]) / r["wolumen_rok_temu"] * 100, 1)
+        if r["wolumen_rok_temu"] else None, axis=1,
+    )
+    return grouped.sort_values("wolumen_teraz", ascending=False).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
 # Eksport: Excel (podsumowanie + tabela + wykres) i PDF (raport dla klienta)
 # ---------------------------------------------------------------------------
 
@@ -432,17 +468,43 @@ def _trend_line_chart_png(phrase: str, tdf: pd.DataFrame, figsize=(5.5, 2.3)) ->
     return buf
 
 
-def generate_excel_report(df: pd.DataFrame, summary: dict | None) -> bytes:
+def _competitor_chart_png(competitor_summary: pd.DataFrame) -> io.BytesIO | None:
+    if competitor_summary is None or competitor_summary.empty:
+        return None
+    d = competitor_summary.sort_values("wolumen_teraz")
+    fig, ax = _dark_fig((7, max(3, 0.5 * len(d))))
+    ax.barh(d["konkurent"], d["wolumen_teraz"], color=ODYSEO_PURPLE_LIGHT)
+    ax.set_xlabel("Łączny wolumen wyszukiwań fraz brandowych (teraz) / mies.")
+    ax.set_title("Analiza konkurencji — wolumen fraz brandowych")
+    fig.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=150, facecolor="black")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def generate_excel_report(df: pd.DataFrame, summary: dict | None, client_name: str = "",
+                           competitor_df: pd.DataFrame | None = None,
+                           competitor_summary: pd.DataFrame | None = None) -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         df.to_excel(writer, index=False, sheet_name="Dane szczegółowe")
+
+        if competitor_df is not None and not competitor_df.empty:
+            competitor_df.to_excel(writer, index=False, sheet_name="Konkurencja — frazy")
+            if competitor_summary is not None and not competitor_summary.empty:
+                competitor_summary.to_excel(writer, index=False, sheet_name="Konkurencja — podsumowanie")
 
         if summary is not None:
             ws = writer.book.create_sheet("Podsumowanie", 0)
             bold = Font(bold=True, color="422AAB")
             title = Font(bold=True, size=14, color="422AAB")
 
-            ws["A1"] = "Aura Herbals — podsumowanie fraz"
+            title_text = "Trendomat by Odyseo — podsumowanie fraz"
+            if client_name:
+                title_text += f" ({client_name})"
+            ws["A1"] = title_text
             ws["A1"].font = title
             ws["A2"] = f"Wygenerowano: {dt.date.today().isoformat()}"
 
@@ -520,7 +582,9 @@ def _pdf_bg(canvas, doc_):
     canvas.restoreState()
 
 
-def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) -> bytes:
+def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict, client_name: str = "",
+                         competitor_df: pd.DataFrame | None = None,
+                         competitor_summary: pd.DataFrame | None = None) -> bytes:
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=1.5 * cm, bottomMargin=1.5 * cm,
                              leftMargin=1.3 * cm, rightMargin=1.3 * cm)
@@ -551,11 +615,14 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) ->
             ("ROWBACKGROUNDS", (0, 1), (-1, -1), [PDF_BLACK, colors.HexColor("#0D0D0D")]),
         ])
 
+    title_text = "Trendomat by Odyseo — raport trendów wyszukiwań"
     story = [
-        Paragraph("Aura Herbals — raport trendów wyszukiwań", h1),
-        Paragraph(f"Wygenerowano: {dt.date.today().strftime('%d.%m.%Y')}", footer_style),
-        Spacer(1, 0.5 * cm),
+        Paragraph(title_text, h1),
     ]
+    if client_name:
+        story.append(Paragraph(f"Klient / marka: {client_name}", footer_style))
+    story.append(Paragraph(f"Wygenerowano: {dt.date.today().strftime('%d.%m.%Y')}", footer_style))
+    story.append(Spacer(1, 0.5 * cm))
 
     # ------------------------------------------------------------------
     # METODOLOGIA — skąd pochodzą dane i jak działają narzędzia
@@ -755,6 +822,51 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) ->
         chart_buf = _total_volume_chart_png(summary)
         story.append(Image(chart_buf, width=12 * cm, height=7.2 * cm))
 
+    # ------------------------------------------------------------------
+    # ROZDZIAŁ 4: analiza konkurencji (opcjonalny) — tylko wolumen z DataForSEO,
+    # bez Google Trends, frazy pogrupowane wg przypisanego konkurenta
+    # ------------------------------------------------------------------
+    if competitor_df is not None and not competitor_df.empty:
+        story.append(PageBreak())
+        story.append(Paragraph("4. Analiza marek konkurencji", h1))
+        story.append(Paragraph(
+            "Wolumen wyszukiwań fraz brandowych przypisanych do poszczególnych konkurentów "
+            "(źródło: DataForSEO / Google Ads — bez Google Trends).", body))
+        story.append(Spacer(1, 0.3 * cm))
+
+        chart_buf = _competitor_chart_png(competitor_summary)
+        if chart_buf is not None:
+            story.append(Image(chart_buf, width=15 * cm,
+                                height=15 * cm * min(1.0, 0.15 * max(3, len(competitor_summary)))))
+            story.append(Spacer(1, 0.4 * cm))
+
+        def hdr(*labels):
+            return [Paragraph(lbl, th_style) for lbl in labels]
+
+        if competitor_summary is not None and not competitor_summary.empty:
+            story.append(Paragraph("Podsumowanie wg konkurenta", h2))
+            sum_rows = [hdr("Konkurent", "Liczba fraz", "Wolumen teraz", "Wolumen rok temu", "Zmiana r/r")] + [
+                [r["konkurent"], str(int(r["liczba_fraz"])), _fmt_num(r["wolumen_teraz"]),
+                 _fmt_num(r["wolumen_rok_temu"]), _fmt_pct(r["zmiana_%"])]
+                for _, r in competitor_summary.iterrows()
+            ]
+            sum_table = Table(sum_rows, colWidths=[4.5 * cm, 2.6 * cm, 3.1 * cm, 3.3 * cm, 2.5 * cm], repeatRows=1)
+            sum_table.setStyle(table_style())
+            story.append(sum_table)
+            story.append(Spacer(1, 0.5 * cm))
+
+        story.append(Paragraph("Szczegóły — frazy wg konkurenta", h2))
+        det_rows = [hdr("Konkurent", "Fraza", "Wolumen teraz", "Wolumen rok temu", "Zmiana r/r")]
+        for _, r in competitor_df.sort_values(["konkurent", "fraza"]).iterrows():
+            det_rows.append([
+                r.get("konkurent", ""), r.get("fraza", ""),
+                _fmt_num(r.get("wolumen_aktualny")), _fmt_num(r.get("wolumen_rok_temu")),
+                _fmt_pct(r.get("zmiana_%")),
+            ])
+        det_table = Table(det_rows, colWidths=[3.2 * cm, 5.6 * cm, 2.7 * cm, 3 * cm, 2.5 * cm], repeatRows=1)
+        det_table.setStyle(table_style())
+        story.append(det_table)
+
     story.append(Spacer(1, 0.6 * cm))
     story.append(Paragraph(
         "Źródło danych: DataForSEO (Google Ads — wolumen wyszukiwań, Google Trends — popularność 0–100). "
@@ -770,8 +882,9 @@ def generate_pdf_report(df: pd.DataFrame, summary: dict | None, trends: dict) ->
 # UI
 # ---------------------------------------------------------------------------
 
-st.title("Aura Herbals — raport fraz (suplementy w kroplach)")
-st.caption("Wolumen aktualny, wolumen sprzed roku i trend Google dla wklejonej listy fraz.")
+st.title("🧭 Trendomat by Odyseo")
+st.caption("Wolumen wyszukiwań (aktualny i sprzed roku) oraz trend Google dla dowolnej listy fraz — "
+           "dla dowolnego klienta i marki.")
 
 with st.sidebar:
     st.header("Klucze API")
@@ -786,6 +899,8 @@ with st.sidebar:
     senuto_password = st.text_input("Senuto hasło", type="password", disabled=not use_senuto)
 
     st.subheader("Ustawienia")
+    client_name = st.text_input("Nazwa klienta / marki (opcjonalnie)",
+                                 placeholder="np. Aura Herbals", help="Pojawi się w tytule raportu PDF/Excel.")
     location_code = st.number_input("Kod lokalizacji DataForSEO (Polska = 2616)", value=2616, step=1)
     language_code = st.text_input("Kod języka DataForSEO", value="pl")
     trends_range = st.selectbox(
@@ -798,7 +913,7 @@ with st.sidebar:
     )
 
 st.subheader("1. Wklej listę fraz (jedna fraza w linii, max 50)")
-raw_phrases = st.text_area("Frazy", height=220, placeholder="krople na sen\nkrople na odporność\n...")
+raw_phrases = st.text_area("Frazy", height=220, placeholder="fraza kluczowa 1\nfraza kluczowa 2\n...")
 
 phrases = parse_phrases(raw_phrases)
 if phrases:
@@ -921,19 +1036,27 @@ if st.session_state.report_df is not None and not st.session_state.report_df.emp
     st.subheader("4. Szczegółowa tabela")
     st.dataframe(df, use_container_width=True, hide_index=True)
 
+    file_slug = slugify(client_name) if client_name else "trendomat"
+    comp_df_for_export = st.session_state.get("competitor_df")
+    comp_summary_for_export = st.session_state.get("competitor_summary")
+
     col1, col2, col3 = st.columns(3)
     with col1:
         csv_bytes = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("Pobierz CSV", data=csv_bytes, file_name="aura_herbals_raport_fraz.csv", mime="text/csv")
+        st.download_button("Pobierz CSV", data=csv_bytes, file_name=f"{file_slug}_raport_fraz.csv", mime="text/csv")
     with col2:
-        excel_bytes = generate_excel_report(df, summary)
+        excel_bytes = generate_excel_report(df, summary, client_name=client_name,
+                                             competitor_df=comp_df_for_export,
+                                             competitor_summary=comp_summary_for_export)
         st.download_button("Pobierz Excel (z podsumowaniem i wykresem)", data=excel_bytes,
-                            file_name="aura_herbals_raport_fraz.xlsx",
+                            file_name=f"{file_slug}_raport_fraz.xlsx",
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     with col3:
-        pdf_bytes = generate_pdf_report(df, summary, st.session_state.trends_data)
+        pdf_bytes = generate_pdf_report(df, summary, st.session_state.trends_data, client_name=client_name,
+                                         competitor_df=comp_df_for_export,
+                                         competitor_summary=comp_summary_for_export)
         st.download_button("Pobierz PDF (raport dla klienta)", data=pdf_bytes,
-                            file_name="aura_herbals_raport_klienta.pdf",
+                            file_name=f"{file_slug}_raport_klienta.pdf",
                             mime="application/pdf")
 
     st.subheader("5. Google Trends — wykres dla wybranej frazy")
@@ -952,6 +1075,88 @@ if st.session_state.report_df is not None and not st.session_state.report_df.emp
         st.info("Brak danych Google Trends — sprawdź klucze API lub spróbuj ponownie.")
 elif st.session_state.report_df is not None:
     st.info("Nie udało się pobrać danych. Sprawdź klucze API i spróbuj ponownie.")
+
+# ---------------------------------------------------------------------------
+# Analiza konkurencji (opcjonalna, ostatnia sekcja) — same frazy brandowe
+# konkurentów, tylko wolumen z DataForSEO (bez Google Trends)
+# ---------------------------------------------------------------------------
+
+st.divider()
+st.subheader("6. Analiza konkurencji (opcjonalnie)")
+st.caption(
+    "Wprowadź frazy brandowe konkurentów i przypisz do nich nazwę konkurenta. Sprawdzimy tylko "
+    "wolumen wyszukiwań (aktualny i sprzed roku) z DataForSEO — bez Google Trends."
+)
+
+if "competitor_input" not in st.session_state:
+    st.session_state.competitor_input = pd.DataFrame(
+        [{"Konkurent": "", "Fraza": ""} for _ in range(3)]
+    )
+
+competitor_input = st.data_editor(
+    st.session_state.competitor_input,
+    num_rows="dynamic",
+    use_container_width=True,
+    key="competitor_editor",
+    column_config={
+        "Konkurent": st.column_config.TextColumn("Konkurent", help="Nazwa marki konkurencji"),
+        "Fraza": st.column_config.TextColumn("Fraza", help="Fraza brandowa powiązana z tym konkurentem"),
+    },
+)
+
+run_competitors = st.button("Pobierz dane o konkurencji", disabled=not dfs_login or not dfs_password)
+
+if "competitor_df" not in st.session_state:
+    st.session_state.competitor_df = None
+if "competitor_summary" not in st.session_state:
+    st.session_state.competitor_summary = None
+
+if run_competitors:
+    valid_rows = competitor_input.dropna(subset=["Konkurent", "Fraza"])
+    valid_rows = valid_rows[(valid_rows["Konkurent"].str.strip() != "") & (valid_rows["Fraza"].str.strip() != "")]
+    if valid_rows.empty:
+        st.warning("Uzupełnij przynajmniej jedną parę Konkurent + Fraza.")
+    elif not dfs_login or not dfs_password:
+        st.error("Podaj login i hasło do DataForSEO w panelu bocznym.")
+    else:
+        mapping_df = valid_rows.rename(columns={"Konkurent": "konkurent", "Fraza": "fraza"}).copy()
+        mapping_df["fraza"] = mapping_df["fraza"].str.strip()
+        mapping_df["konkurent"] = mapping_df["konkurent"].str.strip()
+        unique_phrases = mapping_df["fraza"].drop_duplicates().tolist()
+
+        with st.spinner(f"Pobieram wolumen dla {len(unique_phrases)} fraz konkurencji (DataForSEO)..."):
+            try:
+                comp_vol_df = dfs_search_volume(dfs_login, dfs_password, unique_phrases,
+                                                 int(location_code), language_code)
+            except Exception as e:
+                st.error(f"Błąd DataForSEO (search_volume, konkurencja): {e}")
+                comp_vol_df = pd.DataFrame()
+
+        if comp_vol_df.empty:
+            st.warning("Nie udało się pobrać danych o wolumenie dla podanych fraz konkurencji.")
+        else:
+            competitor_df = mapping_df.merge(
+                comp_vol_df[["fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
+                on="fraza", how="left",
+            )
+            st.session_state.competitor_df = competitor_df
+            st.session_state.competitor_summary = compute_competitor_summary(competitor_df)
+
+if st.session_state.competitor_df is not None and not st.session_state.competitor_df.empty:
+    comp_df = st.session_state.competitor_df
+    comp_summary = st.session_state.competitor_summary
+
+    st.markdown("**Podsumowanie wg konkurenta**")
+    st.dataframe(comp_summary, hide_index=True, use_container_width=True)
+
+    if comp_summary is not None and not comp_summary.empty:
+        st.bar_chart(comp_summary.set_index("konkurent")["wolumen_teraz"])
+
+    st.markdown("**Szczegóły — frazy wg konkurenta**")
+    st.dataframe(
+        comp_df[["konkurent", "fraza", "wolumen_aktualny", "wolumen_rok_temu", "zmiana_%"]],
+        hide_index=True, use_container_width=True,
+    )
 
 st.divider()
 st.caption(
